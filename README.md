@@ -21,11 +21,10 @@ The network iteratively refines $K$ knots along each ray via **self-conditioning
 
 ```
                               ┌────────────────────────────────────────────────────────┐
-                              │                    Network Inputs                      │
+                              │               Purely Geometric Inputs                  │
                               │  • Ray Origin: o in R^3                                │
                               │  • Ray Direction: d in R^3 (or Plücker line (d, m))    │
                               │  • K Candidate Knot Locations: x_1..x_K in R^3         │
-                              │  • K Prior CDF Values: c_1..c_K in [0, 1]              │
                               └───────────────────────────┬────────────────────────────┘
                                                           │
                                                           ▼
@@ -45,7 +44,7 @@ The network iteratively refines $K$ knots along each ray via **self-conditioning
                               ┌────────────────────────────────────────────────────────┐
                               │          Physics Quadrature & On-Ray Projection        │
                               │  • Knot Distances: s_k = s_0 + sum_{j<=k} Delta s_j    │
-                              │  • World Coordinates: x_k = o + s_k * d                │
+                              │  • World Coordinates: x_k = o + s_k * d  (Grounding)   │
                               │  • Optical Hazard: Delta A_k = lambda_k * Delta s_k    │
                               │  • Guaranteed Monotone CDF: C_k = 1 - exp(-sum Delta A)│
                               └────────────────────────────────────────────────────────┘
@@ -55,7 +54,8 @@ The network iteratively refines $K$ knots along each ray via **self-conditioning
 2. **$K$ Candidate Knots in World Space:** 
    $$\mathbf{x}_k = \mathbf{o} + s_k \mathbf{d} \quad \in \mathbb{R}^3$$
    where $s_k \ge 0$ is the distance along the ray.
-3. **Knot CDF Values:** Current cumulative return probabilities $c_k \in [0, 1]$ or hazard increments $\Delta A_k$.
+
+*(Note: Prior CDF values are intentionally **not** passed into the network. The spatial field at $\mathbf{x}_k$ dictates the local density $\lambda(\mathbf{x}_k)$, and the CDF is obtained as a closed-form integral along the ray. Omitting old CDF values from the input prevents feedback error accumulation and keeps the self-conditioning loop purely geometric).*
 
 ### Output Signature: $(B, K, 2)$ per Batch
 
