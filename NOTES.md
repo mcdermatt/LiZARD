@@ -32,3 +32,8 @@ Alternate strategy (grounded input):
 * also add training data to get (o, 0.9*p) , etc with all zeros in the CDF
 
 * Shared anchor grid??
+
+
+
+Consider local batching for more efficient learning of CDFs?
+- do experiment with this

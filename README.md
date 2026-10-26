@@ -7,9 +7,93 @@ Exploring LiDAR-Based Neural Hazard Fields
 1. **Exact segment additivity is easy, but it isn't the hard problem.** If $A$ is written as a monotone per-line potential $\Phi(\ell,t)$, you get nonnegativity, monotonicity, $A(\mathbf a,\mathbf a)=0$, additivity and reversal symmetry by construction. No regularization is needed, and the network runs once per ray: every query distance is then closed-form.
 2. **None of your three losses touches cross-ray consistency.** The additivity, symmetry and CDF terms each act on points of a single line. A model that satisfies all of them exactly can still give unrelated hazards to the same voxel on two crossing rays. Additivity buys independence from the sensor origin, not independence from direction.
 3. **Exact cross-ray consistency is the same thing as being a line integral of a 3D field** (Prop. 2 below). So you have two choices. You can integrate, either numerically or analytically over a basis with closed-form line integrals. Or you can accept approximate consistency, enforced by a regularizer that has to cover 4D line space.
-4. **My recommendation is to integrate analytically, with Gaussian hazard primitives.** Hazards add, so there is no sorting and no alpha-compositing approximation: Beer–Lambert holds exactly. Every property you listed is guaranteed, and evaluation needs no MLP. This is probably the fastest consistent option, and you can add view-dependence where it's physically motivated (foliage).
+4. **Current direction: the Self-Conditioned Knot CDF (SCK, §0).** A recurrent network places $K$ knots on each ray in $R$ passes (where to look, decided jointly), and each knot's hazard increment is read from a shared 3D hash field at that knot (what is there, decided locally). That gives single-pass-style speed ($R$ sequential network calls, no dense sampling) and NeRF-style cross-ray consistency, without an explicit global primitive set: all scene knowledge stays in the network weights.
+5. **Alternative: integrate analytically, with Gaussian hazard primitives.** Hazards add, so there is no sorting and no alpha-compositing approximation: Beer–Lambert holds exactly. Every property you listed is guaranteed, and evaluation needs no MLP. This is probably the fastest consistent option, and you can add view-dependence where it's physically motivated (foliage).
 
 I couldn't read files in the LiZARD workspace (permission denied), so this is based only on your description.
+
+---
+
+## 0. Self-Conditioned Knot CDF (SCK): the current direction
+
+**Goal.** Given a sensor origin $\mathbf o$ and direction $\mathbf d$, output a set of spline knots that directly define the return CDF along the ray, without PLiNK-style dense coarse-to-fine sampling.
+
+### Architecture: split *where* from *what*
+
+1. **Knots live on the ray by construction, not by loss.**
+   $$\mathbf x_k=\mathbf o+s_k\mathbf d,\qquad s_k=\textstyle\sum_{j\le k}\operatorname{softplus}(u_j)$$
+   This gives exact on-ray points, sorted order and learned spacing for free. Free xyz outputs would add two nuisance DoF per knot and cause hash lookups off the ray.
+2. **Where to look: joint, self-conditioned.** Start from fixed, uniform knots $s^{(0)}$, the same at train and test time. For $r=1\dots R$:
+   $$\Delta s^{(r)}=f_\theta\big(\mathbf o,\mathbf d,\{h(\mathbf x_k^{(r-1)})\}_{k=1}^K\big),\qquad s^{(r)}=s^{(r-1)}+\Delta s^{(r)}$$
+   where $f_\theta$ is a shared update operator (MLP or small attention over the $K$ knots), in the style of RAFT, and $h$ is a multiresolution hash encoding. This is where all the rich self-conditioning goes. A wrong placement costs efficiency, not consistency.
+3. **What is there: local, shared across rays.**
+   $$\Delta A_k=\operatorname{softplus}\big(g_\theta(h(\mathbf x_k))\big)\,(s_{k+1}-s_k),\qquad A_k=\textstyle\sum_{j\le k}\Delta A_j,\qquad C_k=1-e^{-A_k}$$
+   The CDF is piecewise and closed-form between knots. Accumulating cumulative hazard, not probability, keeps no-return and partial transmission representable. The width factor makes $\Delta A$ a quadrature of a density, so moving knots changes resolution but not the answer, and two knots on the same surface don't double-count.
+4. **Optional view-dependence dial.** Use $g_\theta(h(\mathbf x_k))+\varepsilon\,c_\theta(\text{ray context})_k$ for grazing-angle or foliage effects. $\varepsilon=0$ gives exact consistency; larger $\varepsilon$ is more flexible but softer.
+
+### Why this is multi-view consistent without a global reference
+
+| Knot output depends on | Cross-ray consistency |
+|---|---|
+| Only local features $h(\mathbf x_k)$ | **exact, by parameter sharing** |
+| $h(\mathbf x_k)$ plus the whole ray / all $K$ knots | soft; needs data or $\mathcal L_{\text{pair}}$ |
+
+This is the NeRF mechanism. Rays are never compared with each other; each is compared only with its own step-function target. Consistency appears because every ray through $\mathbf x$ reads **the same weights** at $\mathbf x$, and the hash grid *is* network weights. Writing knots in xyz is not, on its own, what gives consistency. Shared inputs at those xyz locations are.
+
+### Loss
+
+- **CRPS against step functions.** $\int_0^{s_{\max}}(C(s)-H(s-d))^2\,ds$ with $s\sim\mathcal U$. It's strictly proper, so multimodal returns (foliage, multi-echo) converge to the true mixture, as in PLiNK.
+- **Origin sliding** ($\mathbf o'=\mathbf o+t\mathbf d$, $0<t<d$) teaches shift invariance along each line only, not cross-ray consistency. With local $\Delta A_k$ it is already satisfied by construction. Only slide forward, since space behind the sensor is unobserved, and remember the target changes if the slide crosses a partial reflector.
+
+### Cost
+
+| | Sequential network calls | Hash reads per ray |
+|---|---|---|
+| PLiNK / nerfacto-style | stages × (small MLP over $N$ points) | $N_\text{total}$ (hundreds) |
+| SCK | $R$ (e.g. 3) | $R\cdot K$ (e.g. 48), all parallel within a round |
+
+Latency scales with $R$; memory traffic scales with $R\cdot K$. Feeding raw xyz to the MLP avoids lookups but removes the shared spatial memory that gives consistency.
+
+### Optional: local batching for joint-value variants
+
+If CDF values are allowed to depend on the whole ray ($\varepsilon>0$, or a fully joint head), rays can be compared directly without any reference structure:
+
+1. Sample anchor points $\mathbf p$: returns and free-space points along measured rays.
+2. For each $\mathbf p$, pick $M$ origins from other scans and build rays $\mathbf o_j\to\mathbf p$. These are synthetic rays and need no ground truth.
+3. Run them in the same batch and read the implied local hazard. For piecewise-linear $A$ it's the slope of the segment containing $\mathbf p$: $\hat\lambda=\Delta A_k/\Delta s_k$, closed-form with no autodiff.
+4. Penalize disagreement with a bounded opacity:
+
+```python
+# lam: [P, M] implied hazard at anchor p from M origins
+g = 1 - torch.exp(-lam * delta)
+L_pair = g.var(dim=1).mean()
+```
+
+This is occlusion-agnostic, because $\hat\lambda$ is local. It costs $M$ extra rays per anchor and only covers sampled directions, so it is a fallback, not the main mechanism. See §2 for the derivation.
+
+### Practical gotchas
+
+- Hash-grid gradients with respect to *position* are noisy at cell boundaries. Stop-gradient the knot positions going into $h$ (RAFT-style), or use smoothstep interpolation.
+- Keep a few fixed stratified "safety" knots so that a bad placement at a novel pose degrades gracefully instead of missing a surface.
+- Knots can lock onto the wrong mode. Use the fixed uniform initialization so the first round is just $f_\theta(\mathbf o,\mathbf d)$.
+
+### Closest prior work (position the novelty against these)
+
+- **DONeRF** (Neff et al., 2021): a depth oracle predicts per-ray sample locations.
+- **HyperReel** (Attal et al., CVPR 2023): a network predicts per-ray sample points, then queries a volume.
+- **AdaNeRF** (Kurz et al., ECCV 2022): learned adaptive sampling.
+- **Light Field Networks** (Sitzmann et al., 2021): the pure single-evaluation ray-space extreme.
+- **RAFT** (Teed & Deng, 2020): recurrent shared update operator with feature lookups at current estimates.
+
+The novelty to claim: LiDAR return CDFs, probabilistic step-function (CRPS) targets, and iterative self-conditioned knot refinement.
+
+### First experiment
+
+Use a 2D synthetic scene with known hazard, trained from a few origins. Compare on held-out origins (CRPS against wall-clock time):
+- (a) pure ray network,
+- (b) SCK with local values,
+- (c) SCK with joint values plus $\mathcal L_{\text{pair}}$ via local batching,
+- (d) PLiNK.
 
 ---
 
@@ -262,6 +346,8 @@ On the loss: with $s\sim\mathcal U[0,s_{\max}]$, your CDF loss is the **CRPS**, 
 | Ray-space $\Phi(\ell,t)$ | 1 MLP on 4D line features, then closed-form queries | none / regularized | weak; ray space has 3D occlusion discontinuities inside a 4D domain |
 | Endpoint $A_\theta(\mathbf a,\mathbf b)$ + hash + $\mathcal L_{\text{anchor}}$ | 2 hash lookups + 1 MLP per query | approximate (anchor-regularized) | unknown; better prior than Plücker, to be measured |
 | Horizon Endpoint CDF + hash + $\mathcal L_{\text{anchor}}$ | 2 hash lookups + 1 MLP per ray (closed-form continuous CDF) | approximate (anchor-regularized) | unknown; fast inference + 3D hash prior |
+| **SCK (§0), local values** | $R$ network calls, $R\cdot K$ parallel hash reads | exact (shared field at knots) | expected good; placement errors cost efficiency only |
+| SCK, joint values + $\mathcal L_{\text{pair}}$ | same | approximate (local batching) | unknown; to be measured |
 | Gaussian hazard field | $K_\text{ray}$ × ~40 FLOPs + erf, no MLP | exact | good; explicit parameters, fast Adam convergence |
 
 ---
@@ -276,6 +362,8 @@ On the loss: with $s\sim\mathcal U[0,s_{\max}]$, your CDF loss is the **CRPS**, 
   3. Exact $\Phi(\ell,t)$ plus a consistency regularizer ($\mathcal L_{\text{iso}}$, $\mathcal L_{\text{pair}}$ or $\mathcal L_{\text{anchor}}$)
   4. Pointwise Endpoint $A_\theta(\mathbf a,\mathbf b)$ with a shared 3D hash encoding plus $\mathcal L_{\text{anchor}}$
   5. Continuous Horizon Endpoint CDF (spline/mixture control points) plus $\mathcal L_{\text{anchor}}$
+     - 5a. **SCK (§0) with local knot values**, the current direction
+     - 5b. SCK with joint knot values plus $\mathcal L_{\text{pair}}$ (local batching)
   6. Isotropic Gaussian hazard field
   7. Gaussian field with even-SH anisotropy
   8. Nerfacto
