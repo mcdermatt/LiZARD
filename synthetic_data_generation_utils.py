@@ -1347,3 +1347,206 @@ def _build_orthonormal_basis(axis: np.ndarray) -> np.ndarray:
     u = u / np.linalg.norm(u)
     v = np.cross(axis, u)
     return np.column_stack([u, v, axis])
+
+
+def compute_look_at_rotation(
+    eye: Union[np.ndarray, List[float]],
+    target: Union[np.ndarray, List[float]],
+    up: Union[np.ndarray, List[float]] = (0.0, 0.0, 1.0),
+) -> np.ndarray:
+    """
+    Computes a 3x3 rotation matrix for a sensor at 'eye' looking towards 'target'.
+    Sensor frame convention: X = forward (pointing to target), Y = left, Z = up.
+    
+    Parameters
+    ----------
+    eye : array-like of shape (3,)
+        Position of the sensor in world space.
+    target : array-like of shape (3,)
+        Point in world space the sensor is aimed at.
+    up : array-like of shape (3,)
+        World up direction (default [0, 0, 1]).
+    
+    Returns
+    -------
+    R : np.ndarray of shape (3, 3)
+        Rotation matrix transforming local sensor directions into world directions.
+    """
+    eye = np.asarray(eye, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    up = np.asarray(up, dtype=np.float64)
+
+    forward = target - eye
+    norm_f = np.linalg.norm(forward)
+    if norm_f < 1e-9:
+        return np.eye(3, dtype=np.float64)
+    forward = forward / norm_f
+
+    # Left vector: Y = up x forward (in frame where X is forward, Z is up)
+    left = np.cross(up, forward)
+    norm_l = np.linalg.norm(left)
+    if norm_l < 1e-9:
+        left = np.array([0.0, 1.0, 0.0])
+    else:
+        left = left / norm_l
+
+    # True up vector: Z = forward x left
+    true_up = np.cross(forward, left)
+    norm_u = np.linalg.norm(true_up)
+    if norm_u > 1e-9:
+        true_up = true_up / norm_u
+
+    return np.column_stack([forward, left, true_up])
+
+
+def generate_multiview_dataset(
+    sensor: LidarProjectionModel,
+    scene: Scene,
+    sensor_positions: Union[np.ndarray, List[List[float]]],
+    sensor_rotations: Optional[Union[np.ndarray, List[Any]]] = None,
+    targets: Optional[Union[np.ndarray, List[List[float]]]] = None,
+    method: str = "sample",
+    return_placement: str = "volume",
+    evaluate_cdf_knots: Optional[Union[np.ndarray, List[float]]] = None,
+    random_seed: Optional[int] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Generates a consolidated multi-view training dataset from multiple sensor poses.
+    
+    Parameters
+    ----------
+    sensor : LidarProjectionModel
+        Sensor intrinsics.
+    scene : Scene
+        Populated 3D scene.
+    sensor_positions : list or array of shape (P, 3)
+        Positions of the sensor across P viewpoints.
+    sensor_rotations : list or array of shape (P, 3, 3), optional
+        Orientations corresponding to each position.
+    targets : list or array of shape (P, 3), optional
+        Target points to aim each sensor at (used if sensor_rotations is None).
+    method : str
+        Point return generation method ('sample', 'all', 'strongest').
+    return_placement : str
+        'volume' or 'surface'.
+    evaluate_cdf_knots : array-like of shape (K,), optional
+        Distance values t along each ray at which to evaluate ground-truth CDF(t).
+    random_seed : int, optional
+        Seed for reproducibility.
+        
+    Returns
+    -------
+    dataset : dict of numpy arrays:
+        - 'rays_o': (total_points, 3) or per-ray origins
+        - 'rays_d': (total_points, 3) unit ray directions
+        - 'plucker_d': (total_points, 3) Plücker direction
+        - 'plucker_m': (total_points, 3) Plücker moment (o x d)
+        - 'points': (total_points, 3) 3D return coordinates
+        - 'ranges': (total_points,) distances to returns
+        - 'probabilities': (total_points,) return probabilities
+        - 'pose_indices': (total_points,) index of sensor pose (0 to P-1)
+        - 'poses': (P, 4, 4) SE(3) sensor transformation matrices
+        - 'cdf_knots': (P * rays, K) ground-truth CDF values (if evaluate_cdf_knots is given)
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    positions = np.asarray(sensor_positions, dtype=np.float64)
+    P = len(positions)
+
+    # Compute rotations if not explicitly provided
+    if sensor_rotations is not None:
+        rotations = [_parse_rotation(r) for r in sensor_rotations]
+    elif targets is not None:
+        targets_arr = np.asarray(targets, dtype=np.float64)
+        if len(targets_arr) == 1 and P > 1:
+            targets_arr = np.repeat(targets_arr, P, axis=0)
+        rotations = [compute_look_at_rotation(positions[i], targets_arr[i]) for i in range(P)]
+    else:
+        rotations = [np.eye(3, dtype=np.float64) for _ in range(P)]
+
+    all_points = []
+    all_ranges = []
+    all_probs = []
+    all_normals = []
+    all_rays_o = []
+    all_rays_d = []
+    all_pose_idx = []
+    all_poses = []
+    all_cdfs = []
+
+    for pose_i in range(P):
+        pos = positions[pose_i]
+        rot = rotations[pose_i]
+
+        # SE(3) matrix: [R | t]
+        T_matrix = np.eye(4, dtype=np.float64)
+        T_matrix[:3, :3] = rot
+        T_matrix[:3, 3] = pos
+        all_poses.append(T_matrix)
+
+        # Generate point cloud for this pose
+        pc = generate_point_cloud(
+            sensor=sensor,
+            scene=scene,
+            sensor_position=pos,
+            sensor_rotation=rot,
+            method=method,
+            return_placement=return_placement,
+        )
+
+        N_pts = len(pc)
+        if N_pts > 0:
+            all_points.append(pc.points)
+            all_ranges.append(pc.ranges)
+            all_probs.append(pc.probabilities)
+            all_normals.append(pc.normals)
+            all_rays_o.append(pc.rays_o)
+            all_rays_d.append(pc.ray_directions)
+            all_pose_idx.append(np.full(N_pts, pose_i, dtype=np.int32))
+
+        # Optional: Ground truth continuous CDF evaluation along rays
+        if evaluate_cdf_knots is not None:
+            knots = np.asarray(evaluate_cdf_knots, dtype=np.float64)
+            rays_o_scan, rays_d_scan = sensor.get_rays(pos, rot, flatten=True)
+            pose_cdfs = np.zeros((len(rays_o_scan), len(knots)), dtype=np.float64)
+            for r_idx in range(len(rays_o_scan)):
+                pose_cdfs[r_idx] = query_cdf_along_ray(
+                    scene=scene,
+                    ray_o=rays_o_scan[r_idx],
+                    ray_d=rays_d_scan[r_idx],
+                    query_distances=knots,
+                )
+            all_cdfs.append(pose_cdfs)
+
+    points_cat = np.concatenate(all_points, axis=0) if all_points else np.empty((0, 3))
+    ranges_cat = np.concatenate(all_ranges, axis=0) if all_ranges else np.empty(0)
+    probs_cat = np.concatenate(all_probs, axis=0) if all_probs else np.empty(0)
+    normals_cat = np.concatenate(all_normals, axis=0) if all_normals else np.empty((0, 3))
+    rays_o_cat = np.concatenate(all_rays_o, axis=0) if all_rays_o else np.empty((0, 3))
+    rays_d_cat = np.concatenate(all_rays_d, axis=0) if all_rays_d else np.empty((0, 3))
+    pose_idx_cat = np.concatenate(all_pose_idx, axis=0) if all_pose_idx else np.empty(0, dtype=np.int32)
+
+    # Compute Plücker coordinates: d and m = o x d
+    plucker_d, plucker_m = rays_to_plucker(rays_o_cat, rays_d_cat)
+
+    dataset = {
+        "points": points_cat,
+        "ranges": ranges_cat,
+        "probabilities": probs_cat,
+        "normals": normals_cat,
+        "rays_o": rays_o_cat,
+        "rays_d": rays_d_cat,
+        "plucker_d": plucker_d,
+        "plucker_m": plucker_m,
+        "plucker": np.concatenate([plucker_d, plucker_m], axis=-1) if len(plucker_d) else np.empty((0, 6)),
+        "pose_indices": pose_idx_cat,
+        "sensor_poses": np.array(all_poses),
+    }
+
+    if evaluate_cdf_knots is not None and all_cdfs:
+        dataset["cdf_knots"] = np.concatenate(all_cdfs, axis=0)
+        dataset["knot_distances"] = np.asarray(evaluate_cdf_knots, dtype=np.float64)
+
+    return dataset
+

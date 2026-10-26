@@ -1,99 +1,120 @@
 # LiZARD
 Exploring LiDAR-Based Neural Hazard Fields
 
-
 ## Summary
 
 1. **Exact segment additivity is easy, but it isn't the hard problem.** If $A$ is written as a monotone per-line potential $\Phi(\ell,t)$, you get nonnegativity, monotonicity, $A(\mathbf a,\mathbf a)=0$, additivity and reversal symmetry by construction. No regularization is needed, and the network runs once per ray: every query distance is then closed-form.
 2. **None of your three losses touches cross-ray consistency.** The additivity, symmetry and CDF terms each act on points of a single line. A model that satisfies all of them exactly can still give unrelated hazards to the same voxel on two crossing rays. Additivity buys independence from the sensor origin, not independence from direction.
 3. **Exact cross-ray consistency is the same thing as being a line integral of a 3D field** (Prop. 2 below). So you have two choices. You can integrate, either numerically or analytically over a basis with closed-form line integrals. Or you can accept approximate consistency, enforced by a regularizer that has to cover 4D line space.
-4. **Current direction: the Self-Conditioned Knot CDF (SCK, §0).** A recurrent network places $K$ knots on each ray in $R$ passes (where to look, decided jointly), and each knot's hazard increment is read from a shared 3D hash field at that knot (what is there, decided locally). That gives single-pass-style speed ($R$ sequential network calls, no dense sampling) and NeRF-style cross-ray consistency, without an explicit global primitive set: all scene knowledge stays in the network weights.
+4. **Current direction: the Self-Conditioned Knot CDF (SCK, §0).** A recurrent network places $K$ knots on each ray in $R$ passes (where to look, decided jointly via 3D self-conditioning), and each knot's hazard increment is read from a shared 3D field at that knot (what is there, decided locally). That gives single-pass-style speed ($R$ sequential network calls, no dense sampling) and NeRF-style cross-ray consistency, without an explicit global primitive set: all scene knowledge stays in the network weights.
 5. **Alternative: integrate analytically, with Gaussian hazard primitives.** Hazards add, so there is no sorting and no alpha-compositing approximation: Beer–Lambert holds exactly. Every property you listed is guaranteed, and evaluation needs no MLP. This is probably the fastest consistent option, and you can add view-dependence where it's physically motivated (foliage).
-
-I couldn't read files in the LiZARD workspace (permission denied), so this is based only on your description.
 
 ---
 
-## 0. Self-Conditioned Knot CDF (SCK): the current direction
+## 0. Self-Conditioned Knot CDF (SCK): The Proposed Strategy
 
-**Goal.** Given a sensor origin $\mathbf o$ and direction $\mathbf d$, output a set of spline knots that directly define the return CDF along the ray, without PLiNK-style dense coarse-to-fine sampling.
+**Goal.** Given a sensor origin $\mathbf o$ and ray direction $\mathbf d$, directly output a set of spline knots and associated hazard increments that define the continuous return $\text{CDF}(t)$ along the ray, without dense coarse-to-fine sampling (like PLiNK/NeRF).
 
-### Architecture: split *where* from *what*
+### Network Inputs & Outputs
 
-1. **Knots live on the ray by construction, not by loss.**
-   $$\mathbf x_k=\mathbf o+s_k\mathbf d,\qquad s_k=\textstyle\sum_{j\le k}\operatorname{softplus}(u_j)$$
-   This gives exact on-ray points, sorted order and learned spacing for free. Free xyz outputs would add two nuisance DoF per knot and cause hash lookups off the ray.
-2. **Where to look: joint, self-conditioned.** Start from fixed, uniform knots $s^{(0)}$, the same at train and test time. For $r=1\dots R$:
-   $$\Delta s^{(r)}=f_\theta\big(\mathbf o,\mathbf d,\{h(\mathbf x_k^{(r-1)})\}_{k=1}^K\big),\qquad s^{(r)}=s^{(r-1)}+\Delta s^{(r)}$$
-   where $f_\theta$ is a shared update operator (MLP or small attention over the $K$ knots), in the style of RAFT, and $h$ is a multiresolution hash encoding. This is where all the rich self-conditioning goes. A wrong placement costs efficiency, not consistency.
-3. **What is there: local, shared across rays.**
-   $$\Delta A_k=\operatorname{softplus}\big(g_\theta(h(\mathbf x_k))\big)\,(s_{k+1}-s_k),\qquad A_k=\textstyle\sum_{j\le k}\Delta A_j,\qquad C_k=1-e^{-A_k}$$
-   The CDF is piecewise and closed-form between knots. Accumulating cumulative hazard, not probability, keeps no-return and partial transmission representable. The width factor makes $\Delta A$ a quadrature of a density, so moving knots changes resolution but not the answer, and two knots on the same surface don't double-count.
-4. **Optional view-dependence dial.** Use $g_\theta(h(\mathbf x_k))+\varepsilon\,c_\theta(\text{ray context})_k$ for grazing-angle or foliage effects. $\varepsilon=0$ gives exact consistency; larger $\varepsilon$ is more flexible but softer.
+The network iteratively refines $K$ knots along each ray via **self-conditioning**:
 
-### Why this is multi-view consistent without a global reference
-
-| Knot output depends on | Cross-ray consistency |
-|---|---|
-| Only local features $h(\mathbf x_k)$ | **exact, by parameter sharing** |
-| $h(\mathbf x_k)$ plus the whole ray / all $K$ knots | soft; needs data or $\mathcal L_{\text{pair}}$ |
-
-This is the NeRF mechanism. Rays are never compared with each other; each is compared only with its own step-function target. Consistency appears because every ray through $\mathbf x$ reads **the same weights** at $\mathbf x$, and the hash grid *is* network weights. Writing knots in xyz is not, on its own, what gives consistency. Shared inputs at those xyz locations are.
-
-### Loss
-
-- **CRPS against step functions.** $\int_0^{s_{\max}}(C(s)-H(s-d))^2\,ds$ with $s\sim\mathcal U$. It's strictly proper, so multimodal returns (foliage, multi-echo) converge to the true mixture, as in PLiNK.
-- **Origin sliding** ($\mathbf o'=\mathbf o+t\mathbf d$, $0<t<d$) teaches shift invariance along each line only, not cross-ray consistency. With local $\Delta A_k$ it is already satisfied by construction. Only slide forward, since space behind the sensor is unobserved, and remember the target changes if the slide crosses a partial reflector.
-
-### Cost
-
-| | Sequential network calls | Hash reads per ray |
-|---|---|---|
-| PLiNK / nerfacto-style | stages × (small MLP over $N$ points) | $N_\text{total}$ (hundreds) |
-| SCK | $R$ (e.g. 3) | $R\cdot K$ (e.g. 48), all parallel within a round |
-
-Latency scales with $R$; memory traffic scales with $R\cdot K$. Feeding raw xyz to the MLP avoids lookups but removes the shared spatial memory that gives consistency.
-
-### Optional: local batching for joint-value variants
-
-If CDF values are allowed to depend on the whole ray ($\varepsilon>0$, or a fully joint head), rays can be compared directly without any reference structure:
-
-1. Sample anchor points $\mathbf p$: returns and free-space points along measured rays.
-2. For each $\mathbf p$, pick $M$ origins from other scans and build rays $\mathbf o_j\to\mathbf p$. These are synthetic rays and need no ground truth.
-3. Run them in the same batch and read the implied local hazard. For piecewise-linear $A$ it's the slope of the segment containing $\mathbf p$: $\hat\lambda=\Delta A_k/\Delta s_k$, closed-form with no autodiff.
-4. Penalize disagreement with a bounded opacity:
-
-```python
-# lam: [P, M] implied hazard at anchor p from M origins
-g = 1 - torch.exp(-lam * delta)
-L_pair = g.var(dim=1).mean()
+```
+                              ┌────────────────────────────────────────────────────────┐
+                              │                    Network Inputs                      │
+                              │  • Ray Origin: o in R^3                                │
+                              │  • Ray Direction: d in R^3 (or Plücker line (d, m))    │
+                              │  • K Candidate Knot Locations: x_1..x_K in R^3         │
+                              │  • K Prior CDF Values: c_1..c_K in [0, 1]              │
+                              └───────────────────────────┬────────────────────────────┘
+                                                          │
+                                                          ▼
+                                              ┌───────────────────────┐
+                                              │  Neural Architecture  │
+                                              │  (Joint / Recurrent)  │
+                                              └───────────┬───────────┘
+                                                          │
+                                                          ▼
+                              ┌────────────────────────────────────────────────────────┐
+                              │               Network Outputs: (B, K, 2)               │
+                              │  • Channel 0: Spacing Gaps Delta s_k > 0 [meters]      │
+                              │  • Channel 1: Volumetric Density lambda_k >= 0 [m^-1]  │
+                              └───────────────────────────┬────────────────────────────┘
+                                                          │
+                                                          ▼
+                              ┌────────────────────────────────────────────────────────┐
+                              │          Physics Quadrature & On-Ray Projection        │
+                              │  • Knot Distances: s_k = s_0 + sum_{j<=k} Delta s_j    │
+                              │  • World Coordinates: x_k = o + s_k * d                │
+                              │  • Optical Hazard: Delta A_k = lambda_k * Delta s_k    │
+                              │  • Guaranteed Monotone CDF: C_k = 1 - exp(-sum Delta A)│
+                              └────────────────────────────────────────────────────────┘
 ```
 
-This is occlusion-agnostic, because $\hat\lambda$ is local. It costs $M$ extra rays per anchor and only covers sampled directions, so it is a fallback, not the main mechanism. See §2 for the derivation.
+1. **Ray Definition:** Sensor origin $\mathbf{o} \in \mathbb{R}^3$ and unit direction $\mathbf{d} \in \mathbb{R}^3$ (or Plücker coordinates $(\mathbf{d}, \mathbf{m})$ where $\mathbf{m} = \mathbf{o} \times \mathbf{d}$).
+2. **$K$ Candidate Knots in World Space:** 
+   $$\mathbf{x}_k = \mathbf{o} + s_k \mathbf{d} \quad \in \mathbb{R}^3$$
+   where $s_k \ge 0$ is the distance along the ray.
+3. **Knot CDF Values:** Current cumulative return probabilities $c_k \in [0, 1]$ or hazard increments $\Delta A_k$.
 
-### Practical gotchas
+### Output Signature: $(B, K, 2)$ per Batch
 
-- Hash-grid gradients with respect to *position* are noisy at cell boundaries. Stop-gradient the knot positions going into $h$ (RAFT-style), or use smoothstep interpolation.
-- Keep a few fixed stratified "safety" knots so that a bad placement at a novel pose degrades gracefully instead of missing a surface.
-- Knots can lock onto the wrong mode. Use the fixed uniform initialization so the first round is just $f_\theta(\mathbf o,\mathbf d)$.
+For a batch of $B$ rays with $K$ knots, the network outputs a 2-channel tensor of shape `(B, K, 2)`:
+- **Channel 0 (`spacing_gap`):** Positive distance gaps $\Delta s_k = \operatorname{softplus}(u_k) > 0$ between adjacent knots.
+- **Channel 1 (`density`):** Volumetric density $\lambda_k = \operatorname{softplus}(v_k) \ge 0$ ($\text{m}^{-1}$, return likelihood per meter).
 
-### Closest prior work (position the novelty against these)
+### Guaranteed Monotonicity by Construction
 
-- **DONeRF** (Neff et al., 2021): a depth oracle predicts per-ray sample locations.
-- **HyperReel** (Attal et al., CVPR 2023): a network predicts per-ray sample points, then queries a volume.
-- **AdaNeRF** (Kurz et al., ECCV 2022): learned adaptive sampling.
-- **Light Field Networks** (Sitzmann et al., 2021): the pure single-evaluation ray-space extreme.
-- **RAFT** (Teed & Deng, 2020): recurrent shared update operator with feature lookups at current estimates.
+Monotonicity is never left to the loss function to learn by trial and error. It is guaranteed mathematically:
 
-The novelty to claim: LiDAR return CDFs, probabilistic step-function (CRPS) targets, and iterative self-conditioned knot refinement.
+1. **Knot Distance Ordering ($s_1 < s_2 < \dots < s_K$):**
+   $$s_k = s_{\min} + \sum_{j \le k} \Delta s_j$$
+   Since every gap $\Delta s_j > 0$, knots are strictly sorted along the beam and can never invert or cross.
 
-### First experiment
+2. **CDF Monotonicity ($0 \le C_1 \le C_2 \le \dots \le C_K \le 1.0$):**
+   The optical hazard added over segment $k$ is the product of density and segment length:
+   $$\Delta A_k = \lambda_k \cdot \Delta s_k \ge 0$$
+   $$\text{Cumulative Hazard: } A_k = \sum_{j \le k} \Delta A_j \qquad \Longrightarrow \qquad C_k = 1 - e^{-A_k}$$
+   - **Monotonicity:** Because $\Delta A_k \ge 0$, $A_k$ monotonically increases, $e^{-A_k}$ monotonically decreases, and $C_k = 1 - e^{-A_k}$ is **strictly monotonic increasing**.
+   - **Bounds:** When $A_k = 0 \implies C_k = 0$; as $A_k \to \infty \implies C_k \to 1.0$.
+   - **No Double-Counting:** If knots cluster together ($\Delta s_k \to 0$), the added hazard $\Delta A_k \to 0$. Moving knots increases local spatial resolution without artificially inflating return probability.
+   - **Natural Sky/Misses:** If a ray escapes to infinity through empty space, all $\lambda_k = 0 \implies C_k = 0$ everywhere along the ray.
 
-Use a 2D synthetic scene with known hazard, trained from a few origins. Compare on held-out origins (CRPS against wall-clock time):
-- (a) pure ray network,
-- (b) SCK with local values,
-- (c) SCK with joint values plus $\mathcal L_{\text{pair}}$ via local batching,
-- (d) PLiNK.
+### Knot Handling: Training vs. Render Time
+
+- **The Knots are the Network's Internal Spline Parameterization:** The training data target is simply the observed LiDAR data (the measured range step $H(t - d)$ or ground-truth continuous CDF $\text{CDF}^*(t)$). The network learns on its own where to position its knots to minimize the CRPS loss.
+- **Identical Starting State at Train & Render Time:**
+  - **Round 0:** Knots always start with uniform spacing $s_k^{(0)} = \operatorname{linspace}(s_{\min}, s_{\max}, K)$ and $C_k^{(0)} = 0$.
+  - **Rounds $1 \dots R$ (Refinement):** The network updates knot positions and densities.
+  - **Training:** Unroll $R \approx 2\text{--}3$ steps with increasing loss weights on intermediate rounds (RAFT-style) so the model learns both coarse discovery from uniform spacing and fine snapping near surfaces.
+  - **Render Time:** Start from uniform $s^{(0)}$ and iterate $R$ times to converge directly onto the step jumps.
+
+### Why Grounding in World XYZ Enforces Multi-View Consistency
+
+- **In Ray-Space:** Two rays from different sensor poses $\mathbf{o}_A$ and $\mathbf{o}_B$ that hit the same obstacle have completely different $(\mathbf{o}, \mathbf{d})$ and different scalar distances $s_A \ne s_B$. Ray space alone provides no coordinate system to recognize they observe the same obstacle.
+- **In World XYZ:** Both rays intersect at the **exact same 3D coordinate**:
+  $$\mathbf{x} = \mathbf{o}_A + s_A \mathbf{d}_A = \mathbf{o}_B + s_B \mathbf{d}_B \quad \in \mathbb{R}^3$$
+- **Consistency by Construction:** By feeding the 3D location $\mathbf{x}_k \in \mathbb{R}^3$ into the self-conditioning loop, all viewpoints query the same shared spatial field $h(\mathbf{x})$ and attend to one another in world metric space. Furthermore, empty space along one view directly carves false knots from crossing views.
+
+### Origin-Sliding Data Augmentation
+
+Along any ray that has its first interaction at distance $d$, the line segment $[0, d)$ is completely empty space ($\text{CDF} = 0, T = 1$).
+
+We augment training rays by sliding the sensor forward along the ray by $\Delta \in [0, d)$:
+$$\mathbf{o}' = \mathbf{o} + \Delta \cdot \mathbf{d}, \qquad \mathbf{d}' = \mathbf{d}$$
+
+- **Plücker Invariance:** The Plücker coordinates $(\mathbf{d}, \mathbf{m})$ of the infinite line are invariant under this translation because $(\Delta \mathbf{d}) \times \mathbf{d} = 0$.
+- **Exact CDF Shift:** The obstacle is now at distance $d' = d - \Delta$, and the ground-truth CDF shifts identically:
+  $$\text{CDF}_{\mathbf{o}'}(t) = \text{CDF}_{\mathbf{o}}(t + \Delta)$$
+- **Near-Field Generalization:** This allows the network to learn near-field, mid-range, and far-field obstacle CDFs from the exact same physical ray without collecting new scans or running extra collision tests.
+
+### Synthetic Data Pipeline (`synthetic_data_generation_utils.py`)
+
+A modular simulation utility is implemented in `synthetic_data_generation_utils.py` to evaluate SCK:
+- **`LidarProjectionModel`**: Configurable vertical detectors (e.g. 16, 32, 64) and azimuthal resolution.
+- **`Scene` Primitives**: Boxes, spheres, and cylinders with user-specified volumetric return density per meter $\lambda$.
+- **Volumetric Penetration**: Rays entering porous objects (e.g. tree canopies) penetrate into the volume with depths sampled from the truncated exponential distribution $s \sim \lambda e^{-\lambda s}$, while solid surfaces ($\lambda \ge 100$) return immediately at the boundary.
+- **`generate_multiview_dataset`**: Automatically captures multi-view trajectories (e.g. orbit or grid poses) and exports rays $(\mathbf{o}, \mathbf{d})$, Plücker vectors $(\mathbf{d}, \mathbf{m})$, point clouds, and ground-truth continuous $\text{CDF}(t)$ values for supervision.
 
 ---
 
