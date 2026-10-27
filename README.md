@@ -36,14 +36,15 @@ The network iteratively refines $K$ knots along each ray via **self-conditioning
                                                           ▼
                               ┌────────────────────────────────────────────────────────┐
                               │               Network Outputs: (B, K, 2)               │
-                              │  • Channel 0: Spacing Gaps Delta s_k > 0 [meters]      │
+                              │  • Channel 0: Knot Nudging Shift delta s_k in [-d, +d] │
                               │  • Channel 1: Volumetric Density lambda_k >= 0 [m^-1]  │
                               └───────────────────────────┬────────────────────────────┘
                                                           │
                                                           ▼
                               ┌────────────────────────────────────────────────────────┐
-                              │          Physics Quadrature & On-Ray Projection        │
-                              │  • Knot Distances: s_k = s_0 + sum_{j<=k} Delta s_j    │
+                              │       Residual Knot Flow & Physics Quadrature          │
+                              │  • Nudged Knots: s_k^(r+1) = sort(clamp(s_k + delta s))│
+                              │  • Segment Intervals: Delta s_k = s_k - s_{k-1} >= 0   │
                               │  • World Coordinates: x_k = o + s_k * d  (Grounding)   │
                               │  • Optical Hazard: Delta A_k = lambda_k * Delta s_k    │
                               │  • Guaranteed Monotone CDF: C_k = 1 - exp(-sum Delta A)│
@@ -59,17 +60,39 @@ The network iteratively refines $K$ knots along each ray via **self-conditioning
 
 ### Output Signature: $(B, K, 2)$ per Batch
 
-For a batch of $B$ rays with $K$ knots, the network outputs a 2-channel tensor of shape `(B, K, 2)`:
-- **Channel 0 (`spacing_gap`):** Positive distance gaps $\Delta s_k = \operatorname{softplus}(u_k) > 0$ between adjacent knots.
+For a batch of $B$ rays with $K$ candidate knots, the network outputs a 2-channel tensor of shape `(B, K, 2)`:
+- **Channel 0 (`displacement_shift`):** Local residual knot displacement $\delta s_k = \tanh(u_k) \cdot d_{\max} \in [-d_{\max}, +d_{\max}]$ (e.g. $d_{\max} = 0.6\text{m}$).
 - **Channel 1 (`density`):** Volumetric density $\lambda_k = \operatorname{softplus}(v_k) \ge 0$ ($\text{m}^{-1}$, return likelihood per meter).
+
+### Residual Knot Nudging (Self-Conditioned Flow)
+
+Earlier naive approaches parameterized knot placement globally:
+1. **Unbounded Softplus Gaps (Failed):** Predicting absolute gaps $\Delta s_k = \operatorname{softplus}(u_k)$ and summing them via $s_k = s_{\min} + \sum \Delta s$ led knots to drift out to $100\text{m}+$. Because LiDAR supervision ends at the obstacle boundary, the network received zero loss gradient for knots that expanded past the scene.
+2. **Global Softmax Partition (Failed):** Normalizing gaps via $\Delta s_k = \operatorname{softmax}(u)_k \cdot (s_{\max} - s_{\min})$ mathematically bounded the knots to $[s_{\min}, s_{\max}]$, but introduced an **exponential competitive squeeze**. Because 3D positional coordinate magnitudes naturally increase along the ray ($0.1\text{m} \to 15\text{m}$), the MLP trunk produced higher logits for outer knots. Softmax turned this into an extreme power law: the final few knots absorbed $90\%$ of the distance budget ($13\text{m}$), starving the first $25+$ knots and crushing them into the lower-left corner ($0 \to 1.5\text{m}$) before training even began.
+3. **Broken Self-Conditioning (Failed):** Re-generating absolute knot positions from scratch every round meant the network completely discarded the candidate knot coordinates $s^{(r)}$ rather than refining them.
+
+#### The Residual Nudging Solution
+
+True Self-Conditioning models knot dynamics as a **bounded residual displacement field** (analogous to optical flow in RAFT):
+
+1. **Initial State (Round 0):** Knots initialize to a clean, uniform metric grid across $[s_{\min}, s_{\max}]$:
+   $$s_k^{(0)} = \operatorname{linspace}(s_{\min}, s_{\max}, K)$$
+2. **Local Residual Nudging:** For each candidate knot $k$, the network queries 3D scene features at $\mathbf{x}_k = \mathbf{o} + s_k^{(r)}\mathbf{d}$ and predicts a local displacement shift:
+   $$\delta s_k = \tanh(u_k) \cdot d_{\max}$$
+3. **Monotonic Clamped Update:**
+   $$s_k^{(r+1)} = \operatorname{sort}\Big(\operatorname{clamp}\big(s_k^{(r)} + \delta s_k, \, s_{\min}, \, s_{\max}\big)\Big)$$
+   - Sorting guarantees strict monotonicity ($s_1 < s_2 < \dots < s_K$) at all times.
+   - Knots in empty air stay uniformly spaced because they experience zero gradient pulling them away.
+   - Knots adjacent to physical obstacle boundaries feel the continuous L2 CRPS gradient and actively shift toward the step, tightly sandwiching the surface transition into a knife-sharp step.
+4. **Iterative Refinement:** Round $r+1$ re-evaluates the scene at the refined knot positions $s^{(r+1)}$, allowing knots to lock onto surface discontinuities with millimeter precision without any hacky auxiliary loss functions.
 
 ### Guaranteed Monotonicity by Construction
 
 Monotonicity is never left to the loss function to learn by trial and error. It is guaranteed mathematically:
 
 1. **Knot Distance Ordering ($s_1 < s_2 < \dots < s_K$):**
-   $$s_k = s_{\min} + \sum_{j \le k} \Delta s_j$$
-   Since every gap $\Delta s_j > 0$, knots are strictly sorted along the beam and can never invert or cross.
+   $$\Delta s_k = s_k^{(r+1)} - s_{k-1}^{(r+1)} \ge 0 \qquad (\text{with } s_0 = s_{\min})$$
+   Because $s_k^{(r+1)}$ is passed through $\operatorname{sort}$, knots are strictly sorted along the beam and can never invert or cross.
 
 2. **CDF Monotonicity ($0 \le C_1 \le C_2 \le \dots \le C_K \le 1.0$):**
    The optical hazard added over segment $k$ is the product of density and segment length:
