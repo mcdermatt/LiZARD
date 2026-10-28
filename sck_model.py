@@ -5,17 +5,16 @@ Self-Conditioned Knot Network (SCK) for Continuous LiDAR Hazard Fields & Return 
 
 This module provides:
   1. Network Structure:
-     - PositionalEncoding: Scene-scaled vectorized sinusoidal coordinate encoder
-       (vectorized over all frequencies to minimize CUDA kernel launch overhead).
+     - PositionalEncoding: Scene-scaled vectorized sinusoidal coordinate encoder.
      - DeeperSCKNetwork (alias SCKNetwork): Recurrent / self-conditioned knot network
-       with residual knot flow displacements and volumetric density heads.
+       with residual knot flow displacements, volumetric density heads, and a dedicated
+       ray-drop classification head (PLiNK architecture).
   2. Loss Calculation:
-     - interpolate_cdf_to_grid: Piecewise linear CDF evaluation on a fixed query grid
-       (optimized with F.pad boundary expansion).
-     - compute_sck_loss / SCKLoss: Multi-round continuous L2 (CRPS) and optional L1
-       (Wasserstein-1) loss scaled by grid resolution dt to prevent vanishing gradients.
+     - interpolate_cdf_to_grid: Piecewise linear CDF evaluation on a fixed query grid (F.pad).
+     - compute_sck_loss / SCKLoss: PLiNK-style masked continuous CDF loss (evaluated strictly
+       on hitting rays) + binary cross-entropy ray-drop loss + optional L1 Wasserstein term.
   3. Dataset & Fast GPU Batcher:
-     - LidarRayDataset: PyTorch Dataset for rays with GPU support and stripped dead fields.
+     - LidarRayDataset: PyTorch Dataset for rays with GPU support and hit_mask tracking.
      - GPURayBatcher: Ultra-fast zero-copy batcher for rays stored directly in GPU memory.
      - vectorized_gpu_origin_slide: Fully vectorized GPU origin-sliding augmentation.
   4. Training Loop:
@@ -24,7 +23,7 @@ This module provides:
      - train_model: High-level multi-epoch training loop with loss tracking.
   5. Inference:
      - generate_point_cloud_from_network: Inverts predicted continuous CDF to extract 3D points
-       (accumulates GPU tensors in VRAM to avoid synchronous PCIe transfer stalls).
+       with PLiNK ray-drop filtering to cleanly suppress sky and non-return floaters.
 """
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -81,19 +80,19 @@ class PositionalEncoding(nn.Module):
 
         # Stack sin and cos and flatten to match frequency-interleaved layout
         # Shape: (*x.shape, num_freqs, 2, in_dim) -> flatten to (*x.shape, num_freqs * 2 * in_dim)
-        sc = torch.stack([sins, coss], dim=-1)  # (*x.shape, num_freqs, 2)
+        sc = torch.stack([sins, coss], dim=-1)
         sc_flat = sc.permute(*range(x.ndim - 1), -2, -1, -3).flatten(-3)
 
         return torch.cat([x_norm, sc_flat], dim=-1)
 
 
 class DeeperSCKNetwork(nn.Module):
-    """Self-Conditioned Knot Network with True Residual Knot Flow.
+    """Self-Conditioned Knot Network with Residual Knot Flow and Ray-Drop Head.
 
-    In Round 0, candidate knots start uniformly distributed across [s_min, s_max].
-    In subsequent rounds, the network predicts local residual displacements (shifts)
-    that physically nudge candidate knots toward high-gradient / obstacle boundaries,
-    refining knot placement iteratively.
+    Combines:
+      - Continuous self-conditioned residual knot flow for surface distance estimation
+      - PLiNK-style dedicated ray-drop head p_hit in [0, 1] to cleanly classify and
+        prune rays that escape into open sky without hitting obstacles.
 
     Args:
         num_knots: Number of candidate knots K placed along each ray.
@@ -153,13 +152,23 @@ class DeeperSCKNetwork(nn.Module):
         # Channel 1: Local volumetric density (hazard)
         self.out_head = nn.Linear(hidden_dim, 2)
 
-        # Initial biases: 0 displacement shift at start, low initial free-space density
+        # 3. Dedicated Ray-Drop Classification Head (PLiNK architecture)
+        # Evaluates global ray feature to predict p_hit in [0, 1]
+        self.ray_drop_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # Initial biases
         with torch.no_grad():
             self.out_head.bias[0].fill_(0.0)
             self.out_head.bias[1].fill_(-4.0)
+            self.ray_drop_head[-1].bias.fill_(2.0)  # Initial prior: ~88% hit rate
 
     def forward_single_pass(
         self,
+        ray_feat: torch.Tensor,
         ray_o: torch.Tensor,
         ray_d: torch.Tensor,
         s_knots: torch.Tensor,
@@ -167,6 +176,7 @@ class DeeperSCKNetwork(nn.Module):
         """Executes a single round of knot refinement and hazard integration.
 
         Args:
+            ray_feat: Precomputed ray features, shape (B, hidden_dim).
             ray_o: Ray origins, shape (B, 3).
             ray_d: Ray directions, shape (B, 3).
             s_knots: Current knot distances along rays, shape (B, K).
@@ -178,11 +188,6 @@ class DeeperSCKNetwork(nn.Module):
             density: Local volumetric densities, shape (B, K).
         """
         B, K = s_knots.shape
-
-        # Ray encoding (ray origin, direction, and Plücker moment m = o x d)
-        ray_m = torch.cross(ray_o, ray_d, dim=-1)
-        ray_input = torch.cat([ray_o, ray_d, ray_m], dim=-1)
-        ray_feat = F.relu(self.ray_in(self.pos_enc_ray(ray_input)))
 
         # 3D Knot position encoding evaluated at CURRENT knot coordinates
         x_knots = ray_o.unsqueeze(1) + s_knots.unsqueeze(-1) * ray_d.unsqueeze(1)
@@ -206,7 +211,7 @@ class DeeperSCKNetwork(nn.Module):
         new_s_knots, sort_indices = torch.sort(shifted_s, dim=-1)
 
         # 2. Compute hazard intervals between sorted knots
-        # Permute density with sort_indices so densities follow the knots if crossing occurs
+        # Permute density with sort_indices so densities track knots if crossings occur
         raw_density = F.softplus(out[..., 1])
         density = torch.gather(raw_density, -1, sort_indices)
 
@@ -224,8 +229,8 @@ class DeeperSCKNetwork(nn.Module):
         self,
         ray_o: torch.Tensor,
         ray_d: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
-        """Performs iterative multi-round self-conditioned knot estimation.
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+        """Performs iterative multi-round self-conditioned knot estimation + ray-drop prediction.
 
         Args:
             ray_o: Ray origins, shape (B, 3).
@@ -235,21 +240,32 @@ class DeeperSCKNetwork(nn.Module):
             s_final: Final refined knot distances, shape (B, K).
             c_final: Final cumulative return CDF values at knots, shape (B, K).
             round_outputs: List of (s_knots, c_knots) tuples for each refinement round.
+            p_hit: Predicted hit probability in [0, 1], shape (B, 1).
         """
         B = ray_o.shape[0]
 
-        # Start Round 0 with clean, uniformly spaced candidate knots across [s_min, s_max]
+        # 1. Global Ray encoding (ray origin, direction, and Plücker moment m = o x d)
+        ray_m = torch.cross(ray_o, ray_d, dim=-1)
+        ray_input = torch.cat([ray_o, ray_d, ray_m], dim=-1)
+        ray_feat = F.relu(self.ray_in(self.pos_enc_ray(ray_input)))
+
+        # 2. Ray-Drop prediction (PLiNK style)
+        p_hit = torch.sigmoid(self.ray_drop_head(ray_feat))  # (B, 1)
+
+        # 3. Start Round 0 with clean, uniformly spaced candidate knots across [s_min, s_max]
         s_knots = torch.linspace(self.s_min, self.s_max, self.num_knots, device=ray_o.device)
         s_knots = s_knots.unsqueeze(0).expand(B, -1)
 
         outputs = []
         for r in range(self.num_rounds):
-            s_knots, c_knots, shift, density = self.forward_single_pass(ray_o, ray_d, s_knots)
+            s_knots, c_knots, shift, density = self.forward_single_pass(
+                ray_feat, ray_o, ray_d, s_knots
+            )
             outputs.append((s_knots, c_knots))
             # Feed refined knot positions into next round of self-conditioning (stop gradient)
             s_knots = s_knots.detach()
 
-        return s_knots, c_knots, outputs
+        return s_knots, c_knots, outputs, p_hit
 
 
 # Convenient class alias
@@ -307,27 +323,34 @@ def compute_sck_loss(
     round_outputs: List[Tuple[torch.Tensor, torch.Tensor]],
     gt_cdf: torch.Tensor,
     eval_grid: torch.Tensor,
+    p_hit: Optional[torch.Tensor] = None,
+    hit_mask: Optional[torch.Tensor] = None,
     dt: Optional[float] = None,
     weights: Optional[List[float]] = None,
     l1_weight: float = 0.0,
+    lambda_raydrop: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Computes continuous CDF loss scaled by bin width dt across self-conditioning rounds.
+    """Computes continuous CDF loss with PLiNK-style ray-drop masking and BCE classification.
 
-    Supports composite L2 (CRPS) + optional L1 (Wasserstein-1 / Earth Mover's Distance).
-    Adding an L1 term (e.g. l1_weight=0.5) maintains a constant non-vanishing gradient
-    as error drops, preventing premature training plateaus near tight surface steps.
+    When hit_mask is provided:
+      1. CDF loss is MASKED by hit_mask so rays that escape into open sky do NOT force
+         the continuous spline network to fight trying to fit all-zero curves.
+      2. The ray-drop head p_hit is supervised with binary cross-entropy against hit_mask.
 
     Args:
         round_outputs: List of (s_round, c_round) tuples from model forward pass.
         gt_cdf: Ground truth return CDF on eval_grid, shape (B, M).
         eval_grid: Evaluation distances, shape (M,).
+        p_hit: Predicted hit probability from ray_drop_head, shape (B, 1) or (B,).
+        hit_mask: Ground truth hit mask (1.0 = hit, 0.0 = ray-drop/sky), shape (B,) or (B, 1).
         dt: Grid step size. If None, inferred as (eval_grid[-1] - eval_grid[0]) / (M - 1).
         weights: Optional custom list of weights for each self-conditioning round.
         l1_weight: Weight for the linear L1 term (0.0 = pure L2/CRPS, >0 = elastic loss).
+        lambda_raydrop: Weight for the binary cross-entropy ray-drop loss.
 
     Returns:
         total_loss: Differentiable scalar loss tensor.
-        metrics: Dictionary with individual round losses and total loss values.
+        metrics: Dictionary with individual round losses, ray-drop loss, and total loss.
     """
     num_r = len(round_outputs)
     if dt is None:
@@ -339,49 +362,85 @@ def compute_sck_loss(
     total_loss = torch.tensor(0.0, device=gt_cdf.device, dtype=gt_cdf.dtype)
     metrics: Dict[str, float] = {}
 
+    # PLiNK target_drop_mask preparation
+    mask = None
+    n_hits = float(gt_cdf.shape[0])
+    if hit_mask is not None:
+        mask = hit_mask.view(-1, 1).to(gt_cdf.device)
+        n_hits = float(torch.clamp(mask.sum(), min=1.0).item())
+
+    # Multi-round continuous CDF loss (masked by hit_mask)
     for i, ((s_round, c_round), w) in enumerate(zip(round_outputs, weights)):
-        # 1. Project predicted continuous curve onto the evaluation points
         pred_grid = interpolate_cdf_to_grid(s_round, c_round, eval_grid)
         diff = pred_grid - gt_cdf
 
-        # 2. Continuous L2 / CRPS loss scaled by bin width dt
-        round_l2 = dt * torch.sum(diff ** 2, dim=-1).mean()
-
-        # Optional continuous L1 (Wasserstein-1) term for non-vanishing surface gradients
-        if l1_weight > 0.0:
-            round_l1 = dt * torch.sum(torch.abs(diff), dim=-1).mean()
-            round_loss = round_l2 + l1_weight * round_l1
-            metrics[f"l1_round_{i}"] = round_l1.item()
+        if mask is not None:
+            # PLiNK formulation: mask out ray drops from the continuous CDF loss
+            diff = diff * mask
+            round_l2 = dt * (diff ** 2).sum() / n_hits
+            if l1_weight > 0.0:
+                round_l1 = dt * (torch.abs(diff)).sum() / n_hits
+                round_loss = round_l2 + l1_weight * round_l1
+                metrics[f"l1_round_{i}"] = round_l1.item()
+            else:
+                round_loss = round_l2
         else:
-            round_loss = round_l2
+            round_l2 = dt * torch.sum(diff ** 2, dim=-1).mean()
+            if l1_weight > 0.0:
+                round_l1 = dt * torch.sum(torch.abs(diff), dim=-1).mean()
+                round_loss = round_l2 + l1_weight * round_l1
+                metrics[f"l1_round_{i}"] = round_l1.item()
+            else:
+                round_loss = round_l2
 
         total_loss = total_loss + w * round_loss
         metrics[f"loss_round_{i}"] = round_loss.item()
+
+    # PLiNK ray-drop classification loss (BCE)
+    if p_hit is not None and hit_mask is not None:
+        p_hit_flat = p_hit.view(-1)
+        hit_mask_flat = hit_mask.view(-1).float().to(p_hit.device)
+        loss_raydrop = F.binary_cross_entropy(p_hit_flat, hit_mask_flat)
+        total_loss = total_loss + lambda_raydrop * loss_raydrop
+        metrics["loss_raydrop"] = loss_raydrop.item()
 
     metrics["loss_total"] = total_loss.item()
     return total_loss, metrics
 
 
 class SCKLoss(nn.Module):
-    """PyTorch Module wrapper for the multi-round Continuous CDF loss."""
+    """PyTorch Module wrapper for the multi-round Continuous CDF loss and Ray-Drop BCE."""
 
     def __init__(
         self,
         eval_grid: torch.Tensor,
         dt: Optional[float] = None,
         l1_weight: float = 0.0,
+        lambda_raydrop: float = 1.0,
     ):
         super().__init__()
         self.register_buffer("eval_grid", eval_grid)
         self.dt = dt if dt is not None else float((eval_grid[-1] - eval_grid[0]).item() / (eval_grid.shape[0] - 1))
         self.l1_weight = l1_weight
+        self.lambda_raydrop = lambda_raydrop
 
     def forward(
         self,
         round_outputs: List[Tuple[torch.Tensor, torch.Tensor]],
         gt_cdf: torch.Tensor,
+        p_hit: Optional[torch.Tensor] = None,
+        hit_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        loss, _ = compute_sck_loss(round_outputs, gt_cdf, self.eval_grid, dt=self.dt, l1_weight=self.l1_weight)
+        loss, _ = compute_sck_loss(
+            round_outputs,
+            gt_cdf,
+            self.eval_grid,
+            p_hit=p_hit,
+            hit_mask=hit_mask,
+            dt=self.dt,
+            l1_weight=self.l1_weight,
+            lambda_raydrop=self.lambda_raydrop,
+        )
         return loss
 
 
@@ -459,7 +518,7 @@ class GPURayBatcher:
         rays_d: Ray directions, shape (N, 3).
         gt_cdfs: Ground truth CDFs, shape (N, M).
         hit_ranges: Optional hit ranges for origin sliding, shape (N,).
-        hit_masks: Optional hit masks, shape (N,).
+        hit_masks: Optional hit masks for ray drop supervision, shape (N,).
         batch_size: Batch size for iteration.
         shuffle: If True, randomly permutes rays every epoch.
         device: Torch device (defaults to 'cuda' if available).
@@ -524,8 +583,7 @@ class GPURayBatcher:
 class LidarRayDataset(Dataset):
     """PyTorch Dataset for LiDAR ray hazard fields and return CDFs.
 
-    Optimized to eliminate dead calculations (Plücker coordinates, candidate knots,
-    and scalar allocations) that are redundant during training. Supports direct GPU storage.
+    Optimized to eliminate dead calculations. Supports direct GPU storage and hit_mask tracking.
     """
 
     def __init__(
@@ -558,17 +616,11 @@ class LidarRayDataset(Dataset):
         return len(self.rays_o)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        o = self.rays_o[idx]
-        d = self.rays_d[idx]
-        cdf_gt = self.gt_cdfs[idx]
-        range_d = self.hit_ranges[idx]
-
-        # Return only the tensors actively used during training/validation
         return {
-            "ray_o": o,
-            "ray_d": d,
-            "gt_cdf": cdf_gt,
-            "hit_range": range_d,
+            "ray_o": self.rays_o[idx],
+            "ray_d": self.rays_d[idx],
+            "gt_cdf": self.gt_cdfs[idx],
+            "hit_range": self.hit_ranges[idx],
             "hit_mask": self.hit_masks[idx],
         }
 
@@ -586,18 +638,20 @@ def train_step(
     device: Optional[torch.device] = None,
     augment_origin_slide: bool = False,
     l1_weight: float = 0.0,
+    lambda_raydrop: float = 1.0,
 ) -> float:
     """Executes a single forward and backward optimization step on a training batch.
 
     Args:
         model: DeeperSCKNetwork model instance.
         optimizer: Torch optimizer (e.g. Adam).
-        batch: Batch dictionary containing 'ray_o', 'ray_d', and 'gt_cdf'.
+        batch: Batch dictionary containing 'ray_o', 'ray_d', 'gt_cdf', and 'hit_mask'.
         eval_grid: 1D grid distances tensor for CDF loss evaluation.
         dt: Step size of eval_grid. If None, computed from eval_grid.
         device: Torch device. If None, derived from model parameter device.
         augment_origin_slide: If True, applies vectorized GPU origin sliding.
         l1_weight: Weight for linear Wasserstein loss term.
+        lambda_raydrop: Weight for ray-drop classification loss.
 
     Returns:
         float: Training loss for this batch.
@@ -612,17 +666,29 @@ def train_step(
     ray_d = batch["ray_d"].to(device)
     gt_cdf = batch["gt_cdf"].to(device)
     eval_grid = eval_grid.to(device)
+    hit_mask = batch.get("hit_mask", None)
+    if hit_mask is not None:
+        hit_mask = hit_mask.to(device)
 
     # Optional fast GPU vectorized origin sliding
     if augment_origin_slide and "hit_range" in batch:
         hit_ranges = batch["hit_range"].to(device)
         ray_o, gt_cdf = vectorized_gpu_origin_slide(ray_o, ray_d, gt_cdf, hit_ranges, eval_grid)
 
-    # Forward pass through self-conditioning rounds
-    s_final, c_final, round_outputs = model(ray_o, ray_d)
+    # Forward pass through self-conditioning rounds + ray-drop head
+    s_final, c_final, round_outputs, p_hit = model(ray_o, ray_d)
 
-    # Compute continuous multi-round CDF loss
-    total_loss, _ = compute_sck_loss(round_outputs, gt_cdf, eval_grid, dt=dt, l1_weight=l1_weight)
+    # Compute PLiNK-style masked continuous multi-round CDF loss + Ray-Drop BCE
+    total_loss, _ = compute_sck_loss(
+        round_outputs=round_outputs,
+        gt_cdf=gt_cdf,
+        eval_grid=eval_grid,
+        p_hit=p_hit,
+        hit_mask=hit_mask,
+        dt=dt,
+        l1_weight=l1_weight,
+        lambda_raydrop=lambda_raydrop,
+    )
 
     total_loss.backward()
     optimizer.step()
@@ -639,6 +705,7 @@ def train_epoch(
     device: Optional[torch.device] = None,
     augment_origin_slide: bool = False,
     l1_weight: float = 0.0,
+    lambda_raydrop: float = 1.0,
 ) -> float:
     """Runs one full training epoch over the dataloader or GPURayBatcher.
 
@@ -651,6 +718,7 @@ def train_epoch(
         device: Torch device.
         augment_origin_slide: Whether to apply vectorized GPU origin sliding.
         l1_weight: Optional linear L1 loss weight.
+        lambda_raydrop: Weight for ray-drop classification loss.
 
     Returns:
         float: Average loss across all batches in the epoch.
@@ -668,6 +736,7 @@ def train_epoch(
             device=device,
             augment_origin_slide=augment_origin_slide,
             l1_weight=l1_weight,
+            lambda_raydrop=lambda_raydrop,
         )
         epoch_loss += loss
 
@@ -686,8 +755,9 @@ def train_model(
     callback: Optional[Callable[[int, float], None]] = None,
     augment_origin_slide: bool = False,
     l1_weight: float = 0.0,
+    lambda_raydrop: float = 1.0,
 ) -> Dict[str, Any]:
-    """High-level training loop for Self-Conditioned Knot CDF estimation.
+    """High-level training loop for Self-Conditioned Knot CDF estimation and Ray Drop.
 
     Args:
         model: DeeperSCKNetwork instance.
@@ -701,6 +771,7 @@ def train_model(
         callback: Optional callback fn(epoch, avg_loss) called after each epoch.
         augment_origin_slide: If True, applies fast vectorized GPU origin sliding.
         l1_weight: Weight for linear L1 loss term to prevent plateauing.
+        lambda_raydrop: Weight for ray-drop classification loss.
 
     Returns:
         Dict with 'loss_history': list of average losses per epoch.
@@ -732,6 +803,7 @@ def train_model(
             device=device,
             augment_origin_slide=augment_origin_slide,
             l1_weight=l1_weight,
+            lambda_raydrop=lambda_raydrop,
         )
         loss_history.append(avg_loss)
 
@@ -755,14 +827,11 @@ def generate_point_cloud_from_network(
     sensor_rotation: Optional[Any] = None,
     method: str = "threshold",
     threshold: float = 0.5,
+    ray_drop_threshold: float = 0.5,
     batch_size: int = 1024,
     device: Optional[torch.device] = None,
 ) -> Any:
-    """Renders a 3D PointCloud by passing sensor rays through the trained SCKNetwork
-    and inverting the predicted continuous return CDF along each ray.
-
-    Accumulates output tensors on GPU memory to eliminate synchronous per-batch
-    host-to-device stalling, copying to CPU numpy only once at the end.
+    """Renders a 3D PointCloud with PLiNK ray-drop filtering to cleanly suppress sky floaters.
 
     Args:
         model: Trained DeeperSCKNetwork model.
@@ -771,6 +840,7 @@ def generate_point_cloud_from_network(
         sensor_rotation: Rotation object or matrix (scipy Rotation or None).
         method: "threshold" for surface hits, or "sample" for stochastic returns.
         threshold: CDF threshold for hit detection (0.5 = median return distance).
+        ray_drop_threshold: Hit probability threshold (rays with p_hit < ray_drop_threshold are dropped).
         batch_size: Ray batch size for inference.
         device: Torch device for model execution.
 
@@ -808,8 +878,8 @@ def generate_point_cloud_from_network(
             batch_d = torch.from_numpy(rays_d_np[i : i + batch_size]).float().to(device)
             B = batch_o.shape[0]
 
-            # 2. Predict knot distances and CDF values
-            s_knots, c_knots, _ = model(batch_o, batch_d)  # (B, K)
+            # 2. Predict knot distances, CDF values, and Ray-Drop hit probability
+            s_knots, c_knots, _, p_hit = model(batch_o, batch_d)  # (B, K), p_hit is (B, 1)
             K = s_knots.shape[1]
 
             # 3. Prepend boundary knot (s=0, C=0) using F.pad
@@ -817,13 +887,15 @@ def generate_point_cloud_from_network(
             c_ext = F.pad(c_knots, (1, 0), value=0.0)  # (B, K+1)
             c_max = c_ext[:, -1]
 
-            # 4. Target CDF values for inversion
+            # 4. PLiNK Ray-Drop Filter: discard rays escaping into sky
+            ray_hit_mask = (p_hit.squeeze(-1) >= ray_drop_threshold)
+
             if method == "threshold":
                 target = torch.full((B, 1), threshold, device=device)
-                valid_mask = (c_max >= threshold).squeeze(-1)
+                valid_mask = ray_hit_mask & (c_max >= threshold)
             elif method == "sample":
                 u = torch.rand(B, 1, device=device)
-                valid_mask = (u.squeeze(-1) <= c_max)
+                valid_mask = ray_hit_mask & (u.squeeze(-1) <= c_max)
                 target = u
             else:
                 raise ValueError(f"Unknown method '{method}'. Use 'threshold' or 'sample'.")
