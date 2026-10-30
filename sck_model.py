@@ -109,7 +109,7 @@ class DeeperSCKNetwork(nn.Module):
         num_knots: int = 32,
         s_min: float = 0.1,
         s_max: float = 15.0,
-        hidden_dim: int = 128,
+        hidden_dim: int = 256,
         num_hidden_blocks: int = 3,
         num_rounds: int = 2,
         max_displacement: float = 0.6,
@@ -122,8 +122,8 @@ class DeeperSCKNetwork(nn.Module):
         self.max_displacement = max_displacement
 
         # 1. Positional encoders for high-frequency 3D coordinates and rays
-        self.pos_enc_x = PositionalEncoding(in_dim=3, num_freqs=6, max_coord=s_max)
-        self.pos_enc_ray = PositionalEncoding(in_dim=9, num_freqs=4, max_coord=s_max)
+        self.pos_enc_x = PositionalEncoding(in_dim=3, num_freqs=10, max_coord=s_max)
+        self.pos_enc_ray = PositionalEncoding(in_dim=9, num_freqs=10, max_coord=s_max)
 
         self.ray_in = nn.Sequential(
             nn.Linear(self.pos_enc_ray.out_dim, hidden_dim),
@@ -165,6 +165,9 @@ class DeeperSCKNetwork(nn.Module):
             self.out_head.bias[0].fill_(0.0)
             self.out_head.bias[1].fill_(-4.0)
             self.ray_drop_head[-1].bias.fill_(2.0)  # Initial prior: ~88% hit rate
+
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Total model parameters: {total_params:,}")
 
     def forward_single_pass(
         self,
@@ -827,9 +830,11 @@ def generate_point_cloud_from_network(
     sensor_rotation: Optional[Any] = None,
     method: str = "threshold",
     threshold: float = 0.5,
-    ray_drop_threshold: float = 0.5,
+    non_return_threshold: float = 0.5,
+    ray_drop_threshold: Optional[float] = None,
     batch_size: int = 1024,
     device: Optional[torch.device] = None,
+    verbose: bool = False,
 ) -> Any:
     """Renders a 3D PointCloud with PLiNK ray-drop filtering to cleanly suppress sky floaters.
 
@@ -840,12 +845,17 @@ def generate_point_cloud_from_network(
         sensor_rotation: Rotation object or matrix (scipy Rotation or None).
         method: "threshold" for surface hits, or "sample" for stochastic returns.
         threshold: CDF threshold for hit detection (0.5 = median return distance).
-        ray_drop_threshold: Hit probability threshold (rays with p_hit < ray_drop_threshold are dropped).
+        non_return_threshold: Maximum allowable likelihood of non-return in [0, 1].
+            Rays with P(non-return) = (1 - p_hit) > non_return_threshold will NOT
+            generate a measurement (pruned as sky / non-returns). Default: 0.5.
+        ray_drop_threshold: Legacy alias for hit probability threshold.
+            If provided, effective_non_return_threshold = 1.0 - ray_drop_threshold.
         batch_size: Ray batch size for inference.
         device: Torch device for model execution.
+        verbose: If True, prints rendering summary statistics.
 
     Returns:
-        PointCloud instance containing points, probabilities, and ranges.
+        PointCloud instance containing points, probabilities, ranges, and metadata.
     """
     if PointCloud is None:
         raise ImportError(
@@ -855,6 +865,12 @@ def generate_point_cloud_from_network(
 
     if device is None:
         device = next(model.parameters()).device
+
+    # Determine effective maximum non-return probability threshold
+    if ray_drop_threshold is not None:
+        effective_non_return_threshold = 1.0 - ray_drop_threshold
+    else:
+        effective_non_return_threshold = non_return_threshold
 
     model.eval()
 
@@ -887,8 +903,11 @@ def generate_point_cloud_from_network(
             c_ext = F.pad(c_knots, (1, 0), value=0.0)  # (B, K+1)
             c_max = c_ext[:, -1]
 
-            # 4. PLiNK Ray-Drop Filter: discard rays escaping into sky
-            ray_hit_mask = (p_hit.squeeze(-1) >= ray_drop_threshold)
+            # 4. PLiNK Ray-Drop Filter:
+            # Likelihood of non-return is p_non_return = 1.0 - p_hit
+            # If likelihood of non-return is higher than non_return_threshold, DO NOT generate a measurement
+            p_non_return = (1.0 - p_hit).squeeze(-1)
+            ray_hit_mask = (p_non_return <= effective_non_return_threshold)
 
             if method == "threshold":
                 target = torch.full((B, 1), threshold, device=device)
@@ -925,9 +944,20 @@ def generate_point_cloud_from_network(
                 all_rays_d.append(batch_d[valid_mask])
                 all_rays_o.append(batch_o[valid_mask])
 
+    metadata = {
+        "sensor_position": sensor_position,
+        "method": method,
+        "threshold": threshold,
+        "non_return_threshold": effective_non_return_threshold,
+        "total_rays": total_rays,
+        "returned_points": 0,
+        "dropped_rays": total_rays,
+    }
+
     if len(all_points) == 0:
-        print("Warning: No returns met the threshold!")
-        return PointCloud(np.empty((0, 3)), np.empty(0), np.empty(0))
+        if verbose:
+            print("Warning: No returns met the threshold!")
+        return PointCloud(np.empty((0, 3)), np.empty(0), np.empty(0), metadata=metadata)
 
     # Single asynchronous concatenation on GPU followed by one PCIe transfer to CPU
     points = torch.cat(all_points, dim=0).cpu().numpy()
@@ -936,10 +966,24 @@ def generate_point_cloud_from_network(
     rays_d = torch.cat(all_rays_d, dim=0).cpu().numpy()
     rays_o = torch.cat(all_rays_o, dim=0).cpu().numpy()
 
+    metadata["returned_points"] = len(points)
+    metadata["dropped_rays"] = total_rays - len(points)
+
+    if verbose:
+        print(
+            f"Rendered point cloud: {len(points):,} points ({total_rays - len(points):,} rays dropped as non-returns / below threshold)."
+        )
+
     return PointCloud(
         points=points,
         probabilities=probs,
         ranges=ranges,
         ray_directions=rays_d,
         rays_o=rays_o,
+        metadata=metadata,
     )
+
+
+# Convenient aliases for point cloud rendering
+render_novel_point_cloud = generate_point_cloud_from_network
+render_point_cloud = generate_point_cloud_from_network
