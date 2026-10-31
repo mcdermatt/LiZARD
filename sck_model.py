@@ -112,7 +112,7 @@ class DeeperSCKNetwork(nn.Module):
         hidden_dim: int = 256,
         num_hidden_blocks: int = 3,
         num_rounds: int = 2,
-        max_displacement: float = 0.6,
+        max_displacement: float = 1.0,
     ):
         super().__init__()
         self.num_knots = num_knots
@@ -322,82 +322,191 @@ def interpolate_cdf_to_grid(
     return c_interp
 
 
+def exact_continuous_cdf_loss(
+    s_knots: torch.Tensor,
+    c_knots: torch.Tensor,
+    hit_range: torch.Tensor,
+    s_max: float = 15.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Computes exact, closed-form continuous L1 (Wasserstein-1) and L2 (CRPS) loss.
+
+    Evaluates the continuous integral against the exact step-function target 1_{t >= r*}:
+        L_1 = \\int_0^{s_max} |F_spline(t) - 1_{t >= r*}| dt
+        L_2 = \\int_0^{s_max} (F_spline(t) - 1_{t >= r*})^2 dt
+    analytically across trapezoids without any discrete evaluation grid or discretization error.
+
+    Args:
+        s_knots: Refined knot distances along rays, shape (B, K).
+        c_knots: Monotonic return CDF values at knots, shape (B, K).
+        hit_range: Ground truth return range r*, shape (B,) or (B, 1).
+        s_max: Maximum scene range.
+
+    Returns:
+        loss_l1: Exact continuous L1 error per ray, shape (B,).
+        loss_l2: Exact continuous L2 error per ray, shape (B,).
+    """
+    B, K = s_knots.shape
+    device = s_knots.device
+
+    # Boundary knots: (0, 0) and (s_max, c_max)
+    s_0 = torch.zeros(B, 1, device=device)
+    c_0 = torch.zeros(B, 1, device=device)
+    s_end = torch.full((B, 1), s_max, device=device)
+    c_end = c_knots[:, -1:]
+
+    s_all = torch.cat([s_0, s_knots, s_end], dim=-1)  # (B, K+2)
+    c_all = torch.cat([c_0, c_knots, c_end], dim=-1)  # (B, K+2)
+
+    r = hit_range.view(B, 1).clamp(0.0, s_max)
+
+    # Insert r* into the knot sequence
+    idx = torch.searchsorted(s_all.contiguous(), r.contiguous(), right=True)
+    idx = torch.clamp(idx, 1, K + 1)
+
+    s_left = torch.gather(s_all, 1, idx - 1)
+    s_right = torch.gather(s_all, 1, idx)
+    c_left = torch.gather(c_all, 1, idx - 1)
+    c_right = torch.gather(c_all, 1, idx)
+
+    denom = torch.clamp(s_right - s_left, min=1e-5)
+    alpha = torch.clamp((r - s_left) / denom, 0.0, 1.0)
+    c_r = c_left + alpha * (c_right - c_left)
+
+    s_aug = torch.cat([s_all, r], dim=-1)
+    c_aug = torch.cat([c_all, c_r], dim=-1)
+
+    s_sorted, sort_idx = torch.sort(s_aug, dim=-1)
+    c_sorted = torch.gather(c_aug, -1, sort_idx)
+
+    s_l = s_sorted[:, :-1]
+    s_r = s_sorted[:, 1:]
+    c_l = c_sorted[:, :-1]
+    c_r = c_sorted[:, 1:]
+
+    ds = s_r - s_l
+    mid_s = 0.5 * (s_l + s_r)
+    is_after = (mid_s >= r).float()
+
+    # Exact L1 area (Wasserstein-1 / Earth Mover's Distance)
+    area_before = ds * 0.5 * (c_l + c_r)
+    area_after = ds * 0.5 * ((1.0 - c_l) + (1.0 - c_r))
+    loss_l1 = torch.sum((1.0 - is_after) * area_before + is_after * area_after, dim=-1)
+
+    # Exact L2 integral (Continuous Ranked Probability Score / CRPS)
+    e_l = 1.0 - c_l
+    e_r = 1.0 - c_r
+    l2_before = (ds / 3.0) * (c_l**2 + c_l * c_r + c_r**2)
+    l2_after = (ds / 3.0) * (e_l**2 + e_l * e_r + e_r**2)
+    loss_l2 = torch.sum((1.0 - is_after) * l2_before + is_after * l2_after, dim=-1)
+
+    return loss_l1, loss_l2
+
+
 def compute_sck_loss(
     round_outputs: List[Tuple[torch.Tensor, torch.Tensor]],
-    gt_cdf: torch.Tensor,
-    eval_grid: torch.Tensor,
+    hit_range: Optional[torch.Tensor] = None,
+    gt_cdf: Optional[torch.Tensor] = None,
+    eval_grid: Optional[torch.Tensor] = None,
     p_hit: Optional[torch.Tensor] = None,
     hit_mask: Optional[torch.Tensor] = None,
     dt: Optional[float] = None,
     weights: Optional[List[float]] = None,
-    l1_weight: float = 0.0,
+    l1_weight: float = 1.0,
+    l2_weight: float = 1.0,
     lambda_raydrop: float = 1.0,
+    s_max: float = 15.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Computes continuous CDF loss with PLiNK-style ray-drop masking and BCE classification.
 
-    When hit_mask is provided:
-      1. CDF loss is MASKED by hit_mask so rays that escape into open sky do NOT force
-         the continuous spline network to fight trying to fit all-zero curves.
-      2. The ray-drop head p_hit is supervised with binary cross-entropy against hit_mask.
+    Supports two modes:
+      1. Exact Grid-Free Mode (Recommended):
+         When hit_range (r*) is provided, computes exact closed-form Wasserstein-1 and
+         CRPS integrals via trapezoids with ZERO discretization error. No eval_grid needed!
+      2. Discrete Grid Mode (Fallback):
+         When gt_cdf and eval_grid are provided without hit_range, resamples predicted
+         knots onto eval_grid.
 
     Args:
         round_outputs: List of (s_round, c_round) tuples from model forward pass.
-        gt_cdf: Ground truth return CDF on eval_grid, shape (B, M).
-        eval_grid: Evaluation distances, shape (M,).
+        hit_range: Ground truth return range r*, shape (B,) or (B, 1).
+        gt_cdf: Optional ground truth return CDF on eval_grid, shape (B, M).
+        eval_grid: Optional evaluation distances, shape (M,).
         p_hit: Predicted hit probability from ray_drop_head, shape (B, 1) or (B,).
         hit_mask: Ground truth hit mask (1.0 = hit, 0.0 = ray-drop/sky), shape (B,) or (B, 1).
-        dt: Grid step size. If None, inferred as (eval_grid[-1] - eval_grid[0]) / (M - 1).
+        dt: Grid step size (only used in discrete grid fallback mode).
         weights: Optional custom list of weights for each self-conditioning round.
-        l1_weight: Weight for the linear L1 term (0.0 = pure L2/CRPS, >0 = elastic loss).
+        l1_weight: Weight for Wasserstein-1 L1 term.
+        l2_weight: Weight for continuous L2 / CRPS term.
         lambda_raydrop: Weight for the binary cross-entropy ray-drop loss.
+        s_max: Far bound for scene ray distances (meters).
 
     Returns:
         total_loss: Differentiable scalar loss tensor.
         metrics: Dictionary with individual round losses, ray-drop loss, and total loss.
     """
     num_r = len(round_outputs)
-    if dt is None:
-        dt = (eval_grid[-1] - eval_grid[0]).item() / (eval_grid.shape[0] - 1)
-
     if weights is None:
         weights = [0.5 ** (num_r - 1 - i) for i in range(num_r)]
 
-    total_loss = torch.tensor(0.0, device=gt_cdf.device, dtype=gt_cdf.dtype)
+    B = round_outputs[0][0].shape[0]
+    device = round_outputs[0][0].device
+
+    total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
     metrics: Dict[str, float] = {}
 
     # PLiNK target_drop_mask preparation
     mask = None
-    n_hits = float(gt_cdf.shape[0])
+    n_hits = float(B)
     if hit_mask is not None:
-        mask = hit_mask.view(-1, 1).to(gt_cdf.device)
+        mask = hit_mask.view(-1).to(device)
         n_hits = float(torch.clamp(mask.sum(), min=1.0).item())
 
-    # Multi-round continuous CDF loss (masked by hit_mask)
-    for i, ((s_round, c_round), w) in enumerate(zip(round_outputs, weights)):
-        pred_grid = interpolate_cdf_to_grid(s_round, c_round, eval_grid)
-        diff = pred_grid - gt_cdf
+    # Mode 1: Exact Closed-Form Grid-Free Analytic Loss
+    if hit_range is not None:
+        r = hit_range.view(-1).to(device)
+        for i, ((s_round, c_round), w) in enumerate(zip(round_outputs, weights)):
+            l1_per_ray, l2_per_ray = exact_continuous_cdf_loss(
+                s_round, c_round, r, s_max=s_max
+            )
+            if mask is not None:
+                l1_round = (l1_per_ray * mask).sum() / n_hits
+                l2_round = (l2_per_ray * mask).sum() / n_hits
+            else:
+                l1_round = l1_per_ray.mean()
+                l2_round = l2_per_ray.mean()
 
-        if mask is not None:
-            # PLiNK formulation: mask out ray drops from the continuous CDF loss
-            diff = diff * mask
-            round_l2 = dt * (diff ** 2).sum() / n_hits
-            if l1_weight > 0.0:
+            round_loss = l2_weight * l2_round + l1_weight * l1_round
+            total_loss = total_loss + w * round_loss
+            metrics[f"l1_round_{i}"] = l1_round.item()
+            metrics[f"l2_round_{i}"] = l2_round.item()
+            metrics[f"loss_round_{i}"] = round_loss.item()
+
+    # Mode 2: Discrete Grid Fallback Mode
+    elif gt_cdf is not None and eval_grid is not None:
+        eval_grid = eval_grid.to(device)
+        if dt is None:
+            dt = float((eval_grid[-1] - eval_grid[0]).item() / (eval_grid.shape[0] - 1))
+
+        mask_2d = mask.view(-1, 1) if mask is not None else None
+        for i, ((s_round, c_round), w) in enumerate(zip(round_outputs, weights)):
+            pred_grid = interpolate_cdf_to_grid(s_round, c_round, eval_grid)
+            diff = pred_grid - gt_cdf
+
+            if mask_2d is not None:
+                diff = diff * mask_2d
+                round_l2 = dt * (diff ** 2).sum() / n_hits
                 round_l1 = dt * (torch.abs(diff)).sum() / n_hits
-                round_loss = round_l2 + l1_weight * round_l1
-                metrics[f"l1_round_{i}"] = round_l1.item()
             else:
-                round_loss = round_l2
-        else:
-            round_l2 = dt * torch.sum(diff ** 2, dim=-1).mean()
-            if l1_weight > 0.0:
+                round_l2 = dt * torch.sum(diff ** 2, dim=-1).mean()
                 round_l1 = dt * torch.sum(torch.abs(diff), dim=-1).mean()
-                round_loss = round_l2 + l1_weight * round_l1
-                metrics[f"l1_round_{i}"] = round_l1.item()
-            else:
-                round_loss = round_l2
 
-        total_loss = total_loss + w * round_loss
-        metrics[f"loss_round_{i}"] = round_loss.item()
+            round_loss = l2_weight * round_l2 + l1_weight * round_l1
+            total_loss = total_loss + w * round_loss
+            metrics[f"l1_round_{i}"] = round_l1.item()
+            metrics[f"l2_round_{i}"] = round_l2.item()
+            metrics[f"loss_round_{i}"] = round_loss.item()
+    else:
+        raise ValueError("Either hit_range (recommended) or (gt_cdf, eval_grid) must be provided to compute_sck_loss.")
 
     # PLiNK ray-drop classification loss (BCE)
     if p_hit is not None and hit_mask is not None:
@@ -412,37 +521,52 @@ def compute_sck_loss(
 
 
 class SCKLoss(nn.Module):
-    """PyTorch Module wrapper for the multi-round Continuous CDF loss and Ray-Drop BCE."""
+    """PyTorch Module wrapper for the multi-round Continuous CDF loss and Ray-Drop BCE.
+    
+    Supports both exact grid-free analytic loss (passing hit_range) and discrete grid loss.
+    """
 
     def __init__(
         self,
-        eval_grid: torch.Tensor,
+        eval_grid: Optional[torch.Tensor] = None,
         dt: Optional[float] = None,
-        l1_weight: float = 0.0,
+        l1_weight: float = 1.0,
+        l2_weight: float = 1.0,
         lambda_raydrop: float = 1.0,
+        s_max: float = 15.0,
     ):
         super().__init__()
-        self.register_buffer("eval_grid", eval_grid)
-        self.dt = dt if dt is not None else float((eval_grid[-1] - eval_grid[0]).item() / (eval_grid.shape[0] - 1))
+        if eval_grid is not None:
+            self.register_buffer("eval_grid", eval_grid)
+            self.dt = dt if dt is not None else float((eval_grid[-1] - eval_grid[0]).item() / (eval_grid.shape[0] - 1))
+        else:
+            self.eval_grid = None
+            self.dt = None
         self.l1_weight = l1_weight
+        self.l2_weight = l2_weight
         self.lambda_raydrop = lambda_raydrop
+        self.s_max = s_max
 
     def forward(
         self,
         round_outputs: List[Tuple[torch.Tensor, torch.Tensor]],
-        gt_cdf: torch.Tensor,
+        hit_range: Optional[torch.Tensor] = None,
+        gt_cdf: Optional[torch.Tensor] = None,
         p_hit: Optional[torch.Tensor] = None,
         hit_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         loss, _ = compute_sck_loss(
-            round_outputs,
-            gt_cdf,
-            self.eval_grid,
+            round_outputs=round_outputs,
+            hit_range=hit_range,
+            gt_cdf=gt_cdf,
+            eval_grid=self.eval_grid,
             p_hit=p_hit,
             hit_mask=hit_mask,
             dt=self.dt,
             l1_weight=self.l1_weight,
+            l2_weight=self.l2_weight,
             lambda_raydrop=self.lambda_raydrop,
+            s_max=self.s_max,
         )
         return loss
 
@@ -454,60 +578,75 @@ class SCKLoss(nn.Module):
 def vectorized_gpu_origin_slide(
     ray_o: torch.Tensor,
     ray_d: torch.Tensor,
-    gt_cdf: torch.Tensor,
     hit_ranges: torch.Tensor,
-    eval_grid: torch.Tensor,
+    hit_masks: Optional[torch.Tensor] = None,
+    gt_cdf: Optional[torch.Tensor] = None,
+    eval_grid: Optional[torch.Tensor] = None,
     prob: float = 0.5,
     max_slide: float = 0.7,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    s_min: float = 0.1,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Fully vectorized GPU origin-sliding augmentation for entire ray batches.
 
-    Slides ray origins forward into empty space [0, max_slide * hit_range)
-    and shifts the ground-truth CDF using 1D GPU linear interpolation in microseconds.
+    Slides ray origins forward into empty space [0, max_slide * hit_range).
+    Directly updates hit_ranges (r* -> r* - delta) in closed form, and optionally
+    shifts dense gt_cdf if an evaluation grid is provided. Only slides rays that
+    actually hit obstacles (hit_mask > 0).
 
     Args:
         ray_o: Ray origins on GPU, shape (B, 3).
         ray_d: Ray directions on GPU, shape (B, 3).
-        gt_cdf: Ground truth CDF on GPU, shape (B, M).
-        hit_ranges: Hit range distances on GPU, shape (B,).
-        eval_grid: Uniform grid points on GPU, shape (M,).
+        hit_ranges: Hit range distances on GPU, shape (B,) or (B, 1).
+        hit_masks: Optional hit masks (1.0 = hit, 0.0 = sky), shape (B,) or (B, 1).
+        gt_cdf: Optional ground truth CDF on GPU, shape (B, M).
+        eval_grid: Optional uniform grid points on GPU, shape (M,).
         prob: Probability of sliding each valid ray.
         max_slide: Maximum fraction of hit_range to slide forward.
+        s_min: Minimum near bound distance.
 
     Returns:
         ray_o_aug: Augmented ray origins, shape (B, 3).
-        cdf_aug: Augmented ground-truth CDFs, shape (B, M).
+        hit_ranges_aug: Augmented hit ranges, shape matching hit_ranges.
+        cdf_aug: Augmented ground-truth CDFs (or None if gt_cdf was not provided).
     """
-    B, M = gt_cdf.shape
+    B = ray_o.shape[0]
     device = ray_o.device
-    s_min = eval_grid[0]
+    r_flat = hit_ranges.view(-1)
+    min_dist = eval_grid[0].item() if eval_grid is not None else s_min
 
-    # 1. Select rays with obstacles ahead to slide
-    do_slide = (torch.rand(B, device=device) < prob) & (hit_ranges > s_min)
+    # 1. Select rays with obstacles ahead to slide (exclude sky/non-returns)
+    valid_rays = (r_flat > min_dist)
+    if hit_masks is not None:
+        valid_rays = valid_rays & (hit_masks.view(-1) > 0.0)
+
+    do_slide = (torch.rand(B, device=device) < prob) & valid_rays
     u = torch.rand(B, device=device) * max_slide
-    delta = torch.where(do_slide, u * hit_ranges, torch.zeros_like(hit_ranges)).unsqueeze(-1)  # (B, 1)
+    delta = torch.where(do_slide, u * r_flat, torch.zeros_like(r_flat))  # (B,)
 
-    # 2. Shift ray origin forward
-    ray_o_aug = ray_o + delta * ray_d
+    # 2. Shift ray origin forward and adjust hit ranges
+    ray_o_aug = ray_o + delta.unsqueeze(-1) * ray_d
+    hit_ranges_aug = (r_flat - delta).view_as(hit_ranges)
 
-    # 3. 1D vectorized linear interpolation of gt_cdf at query_s = (eval_grid + delta)
-    query_s = eval_grid.unsqueeze(0) + delta  # (B, M)
-    step = (eval_grid[-1] - eval_grid[0]) / (M - 1)
-    coords = (query_s - s_min) / step
+    # 3. Optional dense grid shift if gt_cdf is provided
+    cdf_final = None
+    if gt_cdf is not None and eval_grid is not None:
+        M = gt_cdf.shape[1]
+        query_s = eval_grid.unsqueeze(0) + delta.unsqueeze(-1)  # (B, M)
+        step = (eval_grid[-1] - eval_grid[0]) / (M - 1)
+        coords = (query_s - min_dist) / step
 
-    idx_left = coords.floor().long().clamp(0, M - 2)
-    alpha = (coords - idx_left.float()).clamp(0.0, 1.0)
+        idx_left = coords.floor().long().clamp(0, M - 2)
+        alpha = (coords - idx_left.float()).clamp(0.0, 1.0)
 
-    c_left = torch.gather(gt_cdf, 1, idx_left)
-    c_right = torch.gather(gt_cdf, 1, idx_left + 1)
-    cdf_interp = c_left + alpha * (c_right - c_left)
+        c_left = torch.gather(gt_cdf, 1, idx_left)
+        c_right = torch.gather(gt_cdf, 1, idx_left + 1)
+        cdf_interp = c_left + alpha * (c_right - c_left)
 
-    # Beyond boundary takes the rightmost CDF value
-    c_rightmost = gt_cdf[:, -1:].expand(-1, M)
-    cdf_shifted = torch.where(coords >= (M - 1), c_rightmost, cdf_interp)
+        c_rightmost = gt_cdf[:, -1:].expand(-1, M)
+        cdf_shifted = torch.where(coords >= (M - 1), c_rightmost, cdf_interp)
+        cdf_final = torch.where(do_slide.unsqueeze(-1), cdf_shifted, gt_cdf)
 
-    cdf_final = torch.where(do_slide.unsqueeze(-1), cdf_shifted, gt_cdf)
-    return ray_o_aug, cdf_final
+    return ray_o_aug, hit_ranges_aug, cdf_final
 
 
 class GPURayBatcher:
@@ -515,13 +654,14 @@ class GPURayBatcher:
 
     Bypasses PyTorch DataLoader multiprocessing serialization, CPU worker threads,
     and host-to-device transfers, providing up to 25x faster batch iteration.
+    Supports both exact grid-free training (using hit_ranges) and legacy grid training.
 
     Args:
         rays_o: Ray origins, shape (N, 3).
         rays_d: Ray directions, shape (N, 3).
-        gt_cdfs: Ground truth CDFs, shape (N, M).
-        hit_ranges: Optional hit ranges for origin sliding, shape (N,).
+        hit_ranges: Optional hit ranges for exact grid-free training and origin sliding, shape (N,).
         hit_masks: Optional hit masks for ray drop supervision, shape (N,).
+        gt_cdfs: Optional ground truth CDFs, shape (N, M).
         batch_size: Batch size for iteration.
         shuffle: If True, randomly permutes rays every epoch.
         device: Torch device (defaults to 'cuda' if available).
@@ -531,9 +671,9 @@ class GPURayBatcher:
         self,
         rays_o: Union[np.ndarray, torch.Tensor],
         rays_d: Union[np.ndarray, torch.Tensor],
-        gt_cdfs: Union[np.ndarray, torch.Tensor],
         hit_ranges: Optional[Union[np.ndarray, torch.Tensor]] = None,
         hit_masks: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        gt_cdfs: Optional[Union[np.ndarray, torch.Tensor]] = None,
         batch_size: int = 1024,
         shuffle: bool = True,
         device: Optional[Union[str, torch.device]] = None,
@@ -544,7 +684,6 @@ class GPURayBatcher:
 
         self.rays_o = torch.as_tensor(rays_o, dtype=torch.float32, device=self.device)
         self.rays_d = torch.as_tensor(rays_d, dtype=torch.float32, device=self.device)
-        self.gt_cdfs = torch.as_tensor(gt_cdfs, dtype=torch.float32, device=self.device)
         self.hit_ranges = (
             torch.as_tensor(hit_ranges, dtype=torch.float32, device=self.device)
             if hit_ranges is not None
@@ -553,6 +692,11 @@ class GPURayBatcher:
         self.hit_masks = (
             torch.as_tensor(hit_masks, dtype=torch.float32, device=self.device)
             if hit_masks is not None
+            else None
+        )
+        self.gt_cdfs = (
+            torch.as_tensor(gt_cdfs, dtype=torch.float32, device=self.device)
+            if gt_cdfs is not None
             else None
         )
 
@@ -565,37 +709,53 @@ class GPURayBatcher:
 
     def __iter__(self):
         if self.shuffle:
-            indices = torch.randperm(self.N, device=self.device)
+            perm = torch.randperm(self.N, device=self.device)
+            rays_o = self.rays_o[perm]
+            rays_d = self.rays_d[perm]
+            hit_ranges = (
+                self.hit_ranges[perm] if self.hit_ranges is not None else None
+            )
+            hit_masks = (
+                self.hit_masks[perm] if self.hit_masks is not None else None
+            )
+            gt_cdfs = (
+                self.gt_cdfs[perm] if self.gt_cdfs is not None else None
+            )
         else:
-            indices = torch.arange(self.N, device=self.device)
+            rays_o = self.rays_o
+            rays_d = self.rays_d
+            hit_ranges = self.hit_ranges
+            hit_masks = self.hit_masks
+            gt_cdfs = self.gt_cdfs
 
         for i in range(0, self.N, self.batch_size):
-            idx = indices[i : i + self.batch_size]
             batch = {
-                "ray_o": self.rays_o[idx],
-                "ray_d": self.rays_d[idx],
-                "gt_cdf": self.gt_cdfs[idx],
+                "ray_o": rays_o[i : i + self.batch_size],
+                "ray_d": rays_d[i : i + self.batch_size],
             }
-            if self.hit_ranges is not None:
-                batch["hit_range"] = self.hit_ranges[idx]
-            if self.hit_masks is not None:
-                batch["hit_mask"] = self.hit_masks[idx]
+            if hit_ranges is not None:
+                batch["hit_range"] = hit_ranges[i : i + self.batch_size]
+            if hit_masks is not None:
+                batch["hit_mask"] = hit_masks[i : i + self.batch_size]
+            if gt_cdfs is not None:
+                batch["gt_cdf"] = gt_cdfs[i : i + self.batch_size]
             yield batch
 
 
 class LidarRayDataset(Dataset):
     """PyTorch Dataset for LiDAR ray hazard fields and return CDFs.
 
-    Optimized to eliminate dead calculations. Supports direct GPU storage and hit_mask tracking.
+    Optimized to eliminate dead calculations. Supports direct GPU storage, hit_mask tracking,
+    and exact grid-free training using hit_ranges.
     """
 
     def __init__(
         self,
         rays_o: Union[np.ndarray, torch.Tensor],
         rays_d: Union[np.ndarray, torch.Tensor],
-        hit_ranges: Union[np.ndarray, torch.Tensor],
-        hit_masks: Union[np.ndarray, torch.Tensor],
-        gt_cdfs: Union[np.ndarray, torch.Tensor],
+        hit_ranges: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        hit_masks: Optional[Union[np.ndarray, torch.Tensor]] = None,
+        gt_cdfs: Optional[Union[np.ndarray, torch.Tensor]] = None,
         num_knots: int = 32,
         s_min: float = 0.1,
         s_max: float = 15.0,
@@ -605,27 +765,42 @@ class LidarRayDataset(Dataset):
         dev = torch.device(device) if device is not None else None
         self.rays_o = torch.as_tensor(rays_o, dtype=torch.float32, device=dev)
         self.rays_d = torch.as_tensor(rays_d, dtype=torch.float32, device=dev)
-        self.hit_ranges = torch.as_tensor(hit_ranges, dtype=torch.float32, device=dev)
-        self.hit_masks = torch.as_tensor(hit_masks, dtype=torch.float32, device=dev)
-        self.gt_cdfs = torch.as_tensor(gt_cdfs, dtype=torch.float32, device=dev)
+        self.hit_ranges = (
+            torch.as_tensor(hit_ranges, dtype=torch.float32, device=dev)
+            if hit_ranges is not None
+            else None
+        )
+        self.hit_masks = (
+            torch.as_tensor(hit_masks, dtype=torch.float32, device=dev)
+            if hit_masks is not None
+            else None
+        )
+        self.gt_cdfs = (
+            torch.as_tensor(gt_cdfs, dtype=torch.float32, device=dev)
+            if gt_cdfs is not None
+            else None
+        )
 
         self.num_knots = num_knots
         self.s_min = s_min
         self.s_max = s_max
         self.augment_origin_slide = augment_origin_slide
-        self.eval_distances = np.linspace(s_min, s_max, self.gt_cdfs.shape[-1])
 
     def __len__(self) -> int:
         return len(self.rays_o)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return {
+        item = {
             "ray_o": self.rays_o[idx],
             "ray_d": self.rays_d[idx],
-            "gt_cdf": self.gt_cdfs[idx],
-            "hit_range": self.hit_ranges[idx],
-            "hit_mask": self.hit_masks[idx],
         }
+        if self.hit_ranges is not None:
+            item["hit_range"] = self.hit_ranges[idx]
+        if self.hit_masks is not None:
+            item["hit_mask"] = self.hit_masks[idx]
+        if self.gt_cdfs is not None:
+            item["gt_cdf"] = self.gt_cdfs[idx]
+        return item
 
 
 # ==============================================================================
@@ -636,25 +811,32 @@ def train_step(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     batch: Dict[str, torch.Tensor],
-    eval_grid: torch.Tensor,
+    eval_grid: Optional[torch.Tensor] = None,
     dt: Optional[float] = None,
     device: Optional[torch.device] = None,
     augment_origin_slide: bool = False,
-    l1_weight: float = 0.0,
+    l1_weight: float = 1.0,
+    l2_weight: float = 1.0,
     lambda_raydrop: float = 1.0,
+    s_max: float = 15.0,
 ) -> float:
     """Executes a single forward and backward optimization step on a training batch.
+
+    Supports exact grid-free analytic loss when 'hit_range' is present in batch,
+    as well as discrete grid fallback mode when 'gt_cdf' and 'eval_grid' are provided.
 
     Args:
         model: DeeperSCKNetwork model instance.
         optimizer: Torch optimizer (e.g. Adam).
-        batch: Batch dictionary containing 'ray_o', 'ray_d', 'gt_cdf', and 'hit_mask'.
-        eval_grid: 1D grid distances tensor for CDF loss evaluation.
-        dt: Step size of eval_grid. If None, computed from eval_grid.
+        batch: Batch dictionary containing 'ray_o', 'ray_d', optional 'hit_range', 'hit_mask', 'gt_cdf'.
+        eval_grid: Optional 1D grid distances tensor for discrete CDF loss evaluation.
+        dt: Step size of eval_grid (only for discrete grid mode).
         device: Torch device. If None, derived from model parameter device.
         augment_origin_slide: If True, applies vectorized GPU origin sliding.
         l1_weight: Weight for linear Wasserstein loss term.
+        l2_weight: Weight for continuous L2 / CRPS loss term.
         lambda_raydrop: Weight for ray-drop classification loss.
+        s_max: Maximum scene range.
 
     Returns:
         float: Training loss for this batch.
@@ -667,30 +849,48 @@ def train_step(
 
     ray_o = batch["ray_o"].to(device)
     ray_d = batch["ray_d"].to(device)
-    gt_cdf = batch["gt_cdf"].to(device)
-    eval_grid = eval_grid.to(device)
+    hit_range = batch.get("hit_range", None)
+    if hit_range is not None:
+        hit_range = hit_range.to(device)
+
+    gt_cdf = batch.get("gt_cdf", None)
+    if gt_cdf is not None:
+        gt_cdf = gt_cdf.to(device)
+
     hit_mask = batch.get("hit_mask", None)
     if hit_mask is not None:
         hit_mask = hit_mask.to(device)
 
+    if eval_grid is not None:
+        eval_grid = eval_grid.to(device)
+
     # Optional fast GPU vectorized origin sliding
-    if augment_origin_slide and "hit_range" in batch:
-        hit_ranges = batch["hit_range"].to(device)
-        ray_o, gt_cdf = vectorized_gpu_origin_slide(ray_o, ray_d, gt_cdf, hit_ranges, eval_grid)
+    if augment_origin_slide and hit_range is not None:
+        ray_o, hit_range, gt_cdf = vectorized_gpu_origin_slide(
+            ray_o=ray_o,
+            ray_d=ray_d,
+            hit_ranges=hit_range,
+            hit_masks=hit_mask,
+            gt_cdf=gt_cdf,
+            eval_grid=eval_grid,
+        )
 
     # Forward pass through self-conditioning rounds + ray-drop head
     s_final, c_final, round_outputs, p_hit = model(ray_o, ray_d)
 
-    # Compute PLiNK-style masked continuous multi-round CDF loss + Ray-Drop BCE
+    # Compute continuous multi-round loss (Exact Grid-Free or Grid-based) + Ray-Drop BCE
     total_loss, _ = compute_sck_loss(
         round_outputs=round_outputs,
+        hit_range=hit_range,
         gt_cdf=gt_cdf,
         eval_grid=eval_grid,
         p_hit=p_hit,
         hit_mask=hit_mask,
         dt=dt,
         l1_weight=l1_weight,
+        l2_weight=l2_weight,
         lambda_raydrop=lambda_raydrop,
+        s_max=s_max,
     )
 
     total_loss.backward()
@@ -703,12 +903,14 @@ def train_epoch(
     model: nn.Module,
     dataloader: Union[DataLoader, GPURayBatcher, Any],
     optimizer: torch.optim.Optimizer,
-    eval_grid: torch.Tensor,
+    eval_grid: Optional[torch.Tensor] = None,
     dt: Optional[float] = None,
     device: Optional[torch.device] = None,
     augment_origin_slide: bool = False,
-    l1_weight: float = 0.0,
+    l1_weight: float = 1.0,
+    l2_weight: float = 1.0,
     lambda_raydrop: float = 1.0,
+    s_max: float = 15.0,
 ) -> float:
     """Runs one full training epoch over the dataloader or GPURayBatcher.
 
@@ -716,12 +918,14 @@ def train_epoch(
         model: DeeperSCKNetwork instance.
         dataloader: DataLoader or GPURayBatcher yielding ray batches.
         optimizer: Torch optimizer.
-        eval_grid: 1D grid distances tensor for CDF loss evaluation.
+        eval_grid: Optional 1D grid distances tensor for discrete grid mode.
         dt: Optional step size of eval_grid.
         device: Torch device.
         augment_origin_slide: Whether to apply vectorized GPU origin sliding.
-        l1_weight: Optional linear L1 loss weight.
+        l1_weight: Weight for Wasserstein-1 L1 term.
+        l2_weight: Weight for continuous L2 / CRPS term.
         lambda_raydrop: Weight for ray-drop classification loss.
+        s_max: Maximum scene range.
 
     Returns:
         float: Average loss across all batches in the epoch.
@@ -739,7 +943,9 @@ def train_epoch(
             device=device,
             augment_origin_slide=augment_origin_slide,
             l1_weight=l1_weight,
+            l2_weight=l2_weight,
             lambda_raydrop=lambda_raydrop,
+            s_max=s_max,
         )
         epoch_loss += loss
 
@@ -750,31 +956,38 @@ def train_model(
     model: nn.Module,
     dataloader: Union[DataLoader, GPURayBatcher, Any],
     optimizer: torch.optim.Optimizer,
-    eval_grid: torch.Tensor,
+    eval_grid: Optional[torch.Tensor] = None,
     num_epochs: int = 32,
     dt: Optional[float] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
     callback: Optional[Callable[[int, float], None]] = None,
     augment_origin_slide: bool = False,
-    l1_weight: float = 0.0,
+    l1_weight: float = 1.0,
+    l2_weight: float = 1.0,
     lambda_raydrop: float = 1.0,
+    s_max: float = 15.0,
 ) -> Dict[str, Any]:
     """High-level training loop for Self-Conditioned Knot CDF estimation and Ray Drop.
+
+    Operates in exact closed-form grid-free mode whenever the dataloader yields 'hit_range'.
+    No eval_grid required!
 
     Args:
         model: DeeperSCKNetwork instance.
         dataloader: DataLoader or GPURayBatcher for training rays.
         optimizer: Torch optimizer.
-        eval_grid: 1D grid distances tensor for CDF loss evaluation.
+        eval_grid: Optional 1D grid distances tensor for discrete grid mode.
         num_epochs: Number of epochs to train.
-        dt: Grid step size. If None, computed from eval_grid.
+        dt: Optional grid step size (for discrete grid mode).
         device: Torch device to train on. If None, derived from model parameters.
         verbose: If True, prints epoch progress.
         callback: Optional callback fn(epoch, avg_loss) called after each epoch.
         augment_origin_slide: If True, applies fast vectorized GPU origin sliding.
-        l1_weight: Weight for linear L1 loss term to prevent plateauing.
+        l1_weight: Weight for linear Wasserstein-1 L1 loss term.
+        l2_weight: Weight for continuous L2 / CRPS term.
         lambda_raydrop: Weight for ray-drop classification loss.
+        s_max: Maximum scene range.
 
     Returns:
         Dict with 'loss_history': list of average losses per epoch.
@@ -782,9 +995,10 @@ def train_model(
     if device is None:
         device = next(model.parameters()).device
 
-    eval_grid = eval_grid.to(device)
-    if dt is None:
-        dt = (eval_grid[-1] - eval_grid[0]).item() / (eval_grid.shape[0] - 1)
+    if eval_grid is not None:
+        eval_grid = eval_grid.to(device)
+        if dt is None:
+            dt = float((eval_grid[-1] - eval_grid[0]).item() / (eval_grid.shape[0] - 1))
 
     loss_history: List[float] = []
 
@@ -794,7 +1008,8 @@ def train_model(
             if hasattr(dataloader, "dataset")
             else (dataloader.N if hasattr(dataloader, "N") else len(dataloader))
         )
-        print(f"Training on {device} ({dataset_len} rays, {len(dataloader)} batches/epoch)...")
+        mode_str = "Exact Grid-Free Analytic Loss" if eval_grid is None else "Discrete Grid Loss"
+        print(f"Training on {device} ({dataset_len} rays, {len(dataloader)} batches/epoch) [{mode_str}]...")
 
     for epoch in range(num_epochs):
         avg_loss = train_epoch(
@@ -806,7 +1021,9 @@ def train_model(
             device=device,
             augment_origin_slide=augment_origin_slide,
             l1_weight=l1_weight,
+            l2_weight=l2_weight,
             lambda_raydrop=lambda_raydrop,
+            s_max=s_max,
         )
         loss_history.append(avg_loss)
 

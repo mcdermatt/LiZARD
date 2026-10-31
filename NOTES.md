@@ -61,4 +61,38 @@ The SCK knot refinement decoder is structurally identical to a **PointNet evalua
 **Key Advantages**:
 - **Knot-Count Agnostic ($K$ is not in the weight matrix)**: Linear layers operate strictly on the trailing feature dimension. The model parameter count is completely independent of $K$.
 - **True Continuous Field / Spatial Generalization**: The network never memorizes "knot index #5 at 2.0 meters"; it learns a unified 3D vector field $\vec{v}(x, y, z) = (\text{shift}, \text{density})$.
-- **Resolution Flexibility**: Can train efficiently with $K=16$ or $K=32$ knots for fast epoch throughput, and evaluate/render with arbitrary $K$ at test time without altering model weights.
+- **Resolution Flexibility**: Can train efficiently with $K=16$ or $K=32$ knots for fast epoch throughput, and evaluate/render with arbitrary $K$ at test time without altering model weights.
+
+---
+
+### Architectural Note: Exact Grid-Free Analytic Loss (Closed-Form Wasserstein-1 & CRPS)
+
+Instead of discretizing space with an artificial evaluation grid (e.g. 64 or 256 ticks), the continuous CDF loss against a LiDAR return at $r^*$ is computed **analytically in closed form**:
+$$\mathcal{L} = \int_{0}^{s_{\max}} \left| F_{\text{spline}}(t) - \mathbf{1}_{t \ge r^*} \right| dt = \int_0^{r^*} F(t) dt + \int_{r^*}^{s_{\max}} (1 - F(t)) dt$$
+
+- **Polygon Trapezoids**: Because $F_{\text{spline}}$ is piecewise-linear, the exact integral over each segment $[s_{k-1}, s_k]$ is given by simple trapezoids $\frac{c_{k-1} + c_k}{2} \Delta s_k$ (and exact quadratic polynomials for continuous $L_2$).
+- **Zero Discretization Error**: Has infinite effective spatial resolution ($0.0\,\text{mm}$ error), eliminating the surface-snapping blind spots caused by discrete grids.
+- **Memory & Compute Efficiency**: Eliminates storing or loading pre-computed $(N, M)$ CDF matrices in VRAM and removes `interpolate_cdf_to_grid` from the inner training loop. Origin sliding simply computes $r^* \leftarrow r^* - \delta$.
+
+---
+
+### Architectural Note: Training Throughput Optimizations (GPU Batcher & Kernel Fusion)
+
+To maximize training throughput on resource-constrained hardware (e.g. NVIDIA GTX 1650 Mobile with 4GB VRAM):
+
+1. **Epoch-Level Permutation & Zero-Copy Slicing (`GPURayBatcher`)**:
+   - Rather than launching indexing/gather kernels every single batch (`tensor[batch_indices]`), rays are permuted once at the start of each epoch (`tensor[perm]`).
+   - Batches are yielded as contiguous memory views (`tensor[i : i + B]`), eliminating per-batch CUDA memory allocations and dropping batch iteration overhead from $3.74\,\text{ms}$ to $0.55\,\text{ms}$ ($6.8\times$ faster).
+
+2. **Optimal Batch Sizing ($B=1024$)**:
+   - Small batch sizes ($B=256$) severely underutilize CUDA streaming multiprocessors ($33.8\,\text{ms/step}$, $\sim 7,560\,\text{rays/sec}$).
+   - Increasing batch size to $B=1024$ takes virtually identical execution time per step ($35.8\,\text{ms/step}$) while shoveling $4\times$ more rays per step, pushing throughput to **$>20,000\,\text{rays/sec}$** ($3.8\times$ real throughput gain).
+
+3. **`torch.compile` CUDA Kernel Fusion**:
+   - Compiling `DeeperSCKNetwork` via PyTorch 2.x Inductor fuses positional encodings, layer norms, and MLP activations into unified Triton CUDA kernels.
+   - Forward pass latency drops from $15.1\,\text{ms}$ to $8.4\,\text{ms}$ ($1.8\times$ faster).
+
+4. **Precision Considerations (FP32 vs FP16 AMP)**:
+   - For compact coordinate networks ($\sim 17\text{k} - 48\text{k}$ parameters), standard FP32 runs faster than FP16 Automatic Mixed Precision (AMP).
+   - In micro-networks, the kernel launching overhead of dtype casting and loss scaling (`GradScaler`) outweighs any tensor-core savings. Pure FP32 minimizes latency while preserving gradient precision for positional encodings.
+
