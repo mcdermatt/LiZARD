@@ -113,6 +113,7 @@ class DeeperSCKNetwork(nn.Module):
         num_hidden_blocks: int = 3,
         num_rounds: int = 2,
         max_displacement: float = 1.0,
+        cdf_mode: str = "softmax",
     ):
         super().__init__()
         self.num_knots = num_knots
@@ -149,7 +150,8 @@ class DeeperSCKNetwork(nn.Module):
         ])
 
         # Channel 0: Knot displacement shift (residual flow)
-        # Channel 1: Local volumetric density (hazard)
+        # Channel 1: Interval return logit (softmax mode) or hazard density
+        self.cdf_mode = cdf_mode
         self.out_head = nn.Linear(hidden_dim, 2)
 
         # 3. Dedicated Ray-Drop Classification Head (PLiNK architecture)
@@ -163,7 +165,10 @@ class DeeperSCKNetwork(nn.Module):
         # Initial biases
         with torch.no_grad():
             self.out_head.bias[0].fill_(0.0)
-            self.out_head.bias[1].fill_(-4.0)
+            if self.cdf_mode == "softmax":
+                self.out_head.bias[1].fill_(0.0)
+            else:
+                self.out_head.bias[1].fill_(-4.0)
             self.ray_drop_head[-1].bias.fill_(2.0)  # Initial prior: ~88% hit rate
 
         total_params = sum(p.numel() for p in self.parameters())
@@ -176,7 +181,7 @@ class DeeperSCKNetwork(nn.Module):
         ray_d: torch.Tensor,
         s_knots: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Executes a single round of knot refinement and hazard integration.
+        """Executes a single round of knot refinement and CDF calculation.
 
         Args:
             ray_feat: Precomputed ray features, shape (B, hidden_dim).
@@ -185,10 +190,10 @@ class DeeperSCKNetwork(nn.Module):
             s_knots: Current knot distances along rays, shape (B, K).
 
         Returns:
-            new_s_knots: Sorted refined knot distances, shape (B, K).
+            new_s_knots: Bounded refined knot distances, shape (B, K).
             c_knots: Monotonic cumulative return CDF values at knots, shape (B, K).
             shift: Predicted local displacements, shape (B, K).
-            density: Local volumetric densities, shape (B, K).
+            val_out: Interval return logits or volumetric densities, shape (B, K).
         """
         B, K = s_knots.shape
 
@@ -205,28 +210,41 @@ class DeeperSCKNetwork(nn.Module):
 
         out = self.out_head(h)
 
-        # 1. Residual Knot Displacement (Flow): nudge candidate knots locally
-        shift = torch.tanh(out[..., 0]) * self.max_displacement
-        shifted_s = s_knots + shift
-        shifted_s = torch.clamp(shifted_s, self.s_min, self.s_max)
+        # 1. Bounded Knot Displacement (Flow)
+        # Endpoints s_knots[:, 0] = s_min and s_knots[:, -1] = s_max remain pinned.
+        # Each interior knot is bounded by at most 45% of the distance to its nearest neighbor,
+        # guaranteeing strict monotonic ordering (no sorting needed) and preventing knot bunching.
+        gaps = s_knots[:, 1:] - s_knots[:, :-1]
+        room = 0.45 * torch.minimum(gaps[:, :-1], gaps[:, 1:])  # (B, K-2)
+        shift = torch.zeros_like(s_knots)
+        shift[:, 1:-1] = torch.tanh(out[:, 1:-1, 0]) * torch.clamp(room, max=self.max_displacement)
+        new_s_knots = s_knots + shift
 
-        # Maintain monotonic ordering along ray
-        new_s_knots, sort_indices = torch.sort(shifted_s, dim=-1)
+        # 2. Cumulative Return CDF
+        if self.cdf_mode == "softmax":
+            # Interval softmax: predicts probability of return within each interval [s_{k-1}, s_k].
+            # An escape logit (0.0) represents rays escaping without return (sky or transmission).
+            # Avoids exponential density saturation and vanishing gradients.
+            logits = out[..., 1]  # (B, K)
+            escape = torch.zeros(B, 1, device=logits.device)
+            # Softmax over all K-1 intervals + 1 escape bin
+            w = torch.softmax(torch.cat([logits[:, 1:], escape], dim=-1), dim=-1)[:, :-1]  # (B, K-1)
+            # Monotonic CDF: starts at 0 at s_0 = s_min
+            c_knots = torch.cat([torch.zeros(B, 1, device=w.device), torch.cumsum(w, dim=-1)], dim=-1)
+            val_out = logits
+        else:
+            # Fallback legacy hazard integration: c = 1 - exp(-cumsum(density * delta_s))
+            raw_density = F.softplus(out[..., 1])
+            density = raw_density
+            s_boundary = torch.full((B, 1), self.s_min, device=ray_o.device)
+            delta_s = new_s_knots - torch.cat([s_boundary, new_s_knots[:, :-1]], dim=-1)
+            delta_s = torch.clamp(delta_s, min=1e-4)
+            hazard_increments = density * delta_s
+            cum_hazard = torch.cumsum(hazard_increments, dim=-1)
+            c_knots = 1.0 - torch.exp(-cum_hazard)
+            val_out = density
 
-        # 2. Compute hazard intervals between sorted knots
-        # Permute density with sort_indices so densities track knots if crossings occur
-        raw_density = F.softplus(out[..., 1])
-        density = torch.gather(raw_density, -1, sort_indices)
-
-        s_boundary = torch.full((B, 1), self.s_min, device=ray_o.device)
-        delta_s = new_s_knots - torch.cat([s_boundary, new_s_knots[:, :-1]], dim=-1)
-        delta_s = torch.clamp(delta_s, min=1e-4)
-
-        hazard_increments = density * delta_s
-        cum_hazard = torch.cumsum(hazard_increments, dim=-1)
-        c_knots = 1.0 - torch.exp(-cum_hazard)
-
-        return new_s_knots, c_knots, shift, density
+        return new_s_knots, c_knots, shift, val_out
 
     def forward(
         self,
@@ -475,7 +493,11 @@ def compute_sck_loss(
                 l1_round = l1_per_ray.mean()
                 l2_round = l2_per_ray.mean()
 
-            round_loss = l2_weight * l2_round + l1_weight * l1_round
+            # round_loss = l2_weight * l2_round + l1_weight * l1_round #L1 loss is bad! it will cause us to skip transparent surfaces!
+            # Root-CRPS replacement:
+            eps = 1e-6
+            round_loss = torch.sqrt(l2_round + eps)
+            
             total_loss = total_loss + w * round_loss
             metrics[f"l1_round_{i}"] = l1_round.item()
             metrics[f"l2_round_{i}"] = l2_round.item()
@@ -584,7 +606,7 @@ def vectorized_gpu_origin_slide(
     eval_grid: Optional[torch.Tensor] = None,
     prob: float = 0.5,
     max_slide: float = 0.7,
-    s_min: float = 0.1,
+    s_min: float = 0.000001, #0.1,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Fully vectorized GPU origin-sliding augmentation for entire ray batches.
 
