@@ -13,56 +13,63 @@ Exploring LiDAR-Based Neural Hazard Fields
 
 ## 0. Self-Conditioned Knot CDF (SCK): The Proposed Strategy
 
-**Goal.** Given a sensor origin $\mathbf o$ and ray direction $\mathbf d$, directly output a set of spline knots and associated hazard increments that define the continuous return $\text{CDF}(t)$ along the ray, without dense coarse-to-fine sampling (like PLiNK/NeRF).
+**Goal.** Given a sensor origin $\mathbf o$ and ray direction $\mathbf d$, directly output a set of spline knots and associated monotonic return probabilities that define the continuous return $\text{CDF}(t)$ along the ray, without dense coarse-to-fine sampling (like PLiNK/NeRF).
 
-### Network Inputs & Outputs
+### Network Inputs & Outputs (`DeeperSCKNetwork` in `sck_model.py`)
 
-The network iteratively refines $K$ knots along each ray via **self-conditioning**:
+The network iteratively refines $K$ knots along each ray via **self-conditioning**, paired with a dedicated PLiNK-style ray-drop classification head:
 
 ```
                               ┌────────────────────────────────────────────────────────┐
                               │               Purely Geometric Inputs                  │
-                              │  • Ray Origin: o in R^3                                │
-                              │  • Ray Direction: d in R^3 (or Plücker line (d, m))    │
+                              │  • Ray Context: (o, d, m = o x d) in R^9               │
                               │  • K Candidate Knot Locations: x_1..x_K in R^3         │
                               └───────────────────────────┬────────────────────────────┘
                                                           │
                                                           ▼
                                               ┌───────────────────────┐
-                                              │  Neural Architecture  │
-                                              │  (Joint / Recurrent)  │
+                                              │   DeeperSCKNetwork    │
+                                              │  • Ray PE + MLP       │
+                                              │    ├──► ray_drop_head │──► p_hit in [0, 1]
+                                              │    └──► Residual MLP  │
+                                              │  • Knot PE + MLP ─────┤    (K shared knots)
                                               └───────────┬───────────┘
                                                           │
                                                           ▼
                               ┌────────────────────────────────────────────────────────┐
-                              │               Network Outputs: (B, K, 2)               │
-                              │  • Channel 0: Knot Nudging Shift delta s_k in [-d, +d] │
-                              │  • Channel 1: Volumetric Density lambda_k >= 0 [m^-1]  │
+                              │            Per-Knot Outputs: (B, K, 2)                 │
+                              │  • Channel 0: Interior knot shift logit u_k            │
+                              │  • Channel 1: Interval return logit v_k (default       │
+                              │    cdf_mode="softmax") or density logit (legacy mode)  │
                               └───────────────────────────┬────────────────────────────┘
                                                           │
                                                           ▼
                               ┌────────────────────────────────────────────────────────┐
-                              │       Residual Knot Flow & Physics Quadrature          │
-                              │  • Nudged Knots: s_k^(r+1) = sort(clamp(s_k + delta s))│
-                              │  • Segment Intervals: Delta s_k = s_k - s_{k-1} >= 0   │
-                              │  • World Coordinates: x_k = o + s_k * d  (Grounding)   │
-                              │  • Optical Hazard: Delta A_k = lambda_k * Delta s_k    │
-                              │  • Guaranteed Monotone CDF: C_k = 1 - exp(-sum Delta A)│
+                              │     Gap-Bounded Knot Flow & Monotonic CDF Construction │
+                              │  • Endpoints pinned: s_0 = s_min, s_{K-1} = s_max      │
+                              │  • Interior shift: |delta s_k| <= min(0.45*gap, d_max) │
+                              │  • Updated Knots: s_k^(r+1) = s_k^(r) + delta s_k      │
+                              │  • Interval Softmax + Escape Bin (0.0):                │
+                              │      w = softmax([v_1..v_{K-1}, 0.0])[:-1]             │
+                              │  • Guaranteed Monotone CDF: C_0 = 0, C_k = sum_{j<=k}w │
                               └────────────────────────────────────────────────────────┘
 ```
 
-1. **Ray Definition:** Sensor origin $\mathbf{o} \in \mathbb{R}^3$ and unit direction $\mathbf{d} \in \mathbb{R}^3$ (or Plücker coordinates $(\mathbf{d}, \mathbf{m})$ where $\mathbf{m} = \mathbf{o} \times \mathbf{d}$).
-2. **$K$ Candidate Knots in World Space:** 
+1. **Global Ray Context:** Concatenated origin, direction, and Plücker moment $(\mathbf{o}, \mathbf{d}, \mathbf{m} = \mathbf{o} \times \mathbf{d}) \in \mathbb{R}^9$, encoded once per ray via scene-scaled sinusoidal `PositionalEncoding` (10 frequency bands normalized by $s_{\max}$) and a 2-layer MLP (`ray_in`) into $\mathbf{f}_{\text{ray}} \in \mathbb{R}^{H}$.
+2. **Dedicated Ray-Drop Head (PLiNK-style):** Evaluates $\mathbf{f}_{\text{ray}}$ through a 2-layer MLP + sigmoid (`ray_drop_head`, initialized with bias `2.0`, ~88% hit prior) to predict hit probability $p_{\text{hit}} \in [0, 1]$, cleanly separating hitting rays from non-returning sky rays.
+3. **$K$ Candidate Knots in World Space:**
    $$\mathbf{x}_k = \mathbf{o} + s_k \mathbf{d} \quad \in \mathbb{R}^3$$
-   where $s_k \ge 0$ is the distance along the ray.
+   where $s_k \in [s_{\min}, s_{\max}]$ is the distance along the ray, encoded via 10-band sinusoidal positional encoding and `knot_in`, concatenated with $\mathbf{f}_{\text{ray}}$, and passed through a residual MLP trunk (`joint_in` + `num_hidden_blocks` residual blocks).
 
-*(Note: Prior CDF values are intentionally **not** passed into the network. The spatial field at $\mathbf{x}_k$ dictates the local density $\lambda(\mathbf{x}_k)$, and the CDF is obtained as a closed-form integral along the ray. Omitting old CDF values from the input prevents feedback error accumulation and keeps the self-conditioning loop purely geometric).*
+*(Note: Prior CDF values are intentionally **not** passed into the network. Only geometric coordinates $\mathbf{x}_k$ are fed into the refinement loop, preventing feedback error accumulation and keeping self-conditioning purely geometric).*
 
-### Output Signature: $(B, K, 2)$ per Batch
+### Output Signature
 
-For a batch of $B$ rays with $K$ candidate knots, the network outputs a 2-channel tensor of shape `(B, K, 2)`:
-- **Channel 0 (`displacement_shift`):** Local residual knot displacement $\delta s_k = \tanh(u_k) \cdot d_{\max} \in [-d_{\max}, +d_{\max}]$ (e.g. $d_{\max} = 0.6\text{m}$).
-- **Channel 1 (`density`):** Volumetric density $\lambda_k = \operatorname{softplus}(v_k) \ge 0$ ($\text{m}^{-1}$, return likelihood per meter).
+For a batch of $B$ rays with $K$ candidate knots, the per-knot head (`out_head`) outputs a 2-channel tensor of shape `(B, K, 2)` alongside the per-ray hit probability `p_hit` of shape `(B, 1)`:
+- **Channel 0 (`shift`):** Gap-bounded residual displacement for interior knots $k \in \{1, \dots, K-2\}$, with endpoints pinned at $s_{\min}$ and $s_{\max}$ and maximum displacement capped by `max_displacement` (default $d_{\max} = 1.0\text{m}$).
+- **Channel 1 (`cdf_mode`):**
+  - **Default (`cdf_mode="softmax"`):** Interval return logits $v_1, \dots, v_{K-1}$ for each segment $[s_{k-1}, s_k]$, normalized via softmax together with a fixed `0.0` escape bin logit to produce probability increments $w_k \ge 0$ ($\sum w_k \le 1$). Avoids exponential density saturation and vanishing gradients.
+  - **Legacy fallback (`cdf_mode != "softmax"`):** Volumetric density $\lambda_k = \operatorname{softplus}(v_k) \ge 0$ ($\text{m}^{-1}$, bias initialized to `-4.0`), integrated via Beer–Lambert quadrature $\Delta A_k = \lambda_k \cdot \max(s_k - s_{k-1}, 10^{-4})$ and $C_k = 1 - e^{-\sum_{j \le k} \Delta A_j}$.
 
 ### Residual Knot Nudging (Self-Conditioned Flow)
 
@@ -71,74 +78,79 @@ Earlier naive approaches parameterized knot placement globally:
 2. **Global Softmax Partition (Failed):** Normalizing gaps via $\Delta s_k = \operatorname{softmax}(u)_k \cdot (s_{\max} - s_{\min})$ mathematically bounded the knots to $[s_{\min}, s_{\max}]$, but introduced an **exponential competitive squeeze**. Because 3D positional coordinate magnitudes naturally increase along the ray ($0.1\text{m} \to 15\text{m}$), the MLP trunk produced higher logits for outer knots. Softmax turned this into an extreme power law: the final few knots absorbed $90\%$ of the distance budget ($13\text{m}$), starving the first $25+$ knots and crushing them into the lower-left corner ($0 \to 1.5\text{m}$) before training even began.
 3. **Broken Self-Conditioning (Failed):** Re-generating absolute knot positions from scratch every round meant the network completely discarded the candidate knot coordinates $s^{(r)}$ rather than refining them.
 
-#### The Residual Nudging Solution
+#### The Gap-Bounded Residual Nudging Solution
 
-True Self-Conditioning models knot dynamics as a **bounded residual displacement field** (analogous to optical flow in RAFT):
+True Self-Conditioning models knot dynamics as a **gap-bounded residual displacement field** (analogous to optical flow in RAFT):
 
-1. **Initial State (Round 0):** Knots initialize to a clean, uniform metric grid across $[s_{\min}, s_{\max}]$:
+1. **Initial State (Round 0):** Knots initialize to a clean, uniform metric grid across $[s_{\min}, s_{\max}]$ (default $[0.1\text{m}, 15.0\text{m}]$):
    $$s_k^{(0)} = \operatorname{linspace}(s_{\min}, s_{\max}, K)$$
-2. **Local Residual Nudging:** For each candidate knot $k$, the network queries 3D scene features at $\mathbf{x}_k = \mathbf{o} + s_k^{(r)}\mathbf{d}$ and predicts a local displacement shift:
-   $$\delta s_k = \tanh(u_k) \cdot d_{\max}$$
-3. **Monotonic Clamped Update:**
-   $$s_k^{(r+1)} = \operatorname{sort}\Big(\operatorname{clamp}\big(s_k^{(r)} + \delta s_k, \, s_{\min}, \, s_{\max}\big)\Big)$$
-   - Sorting guarantees strict monotonicity ($s_1 < s_2 < \dots < s_K$) at all times.
+2. **Pinned Endpoints & Gap-Bounded Local Nudging:** Endpoints stay fixed at $s_0 = s_{\min}$ and $s_{K-1} = s_{\max}$ ($\delta s_0 = \delta s_{K-1} = 0$). For each interior knot $k \in \{1, \dots, K-2\}$, the network queries 3D scene features at $\mathbf{x}_k = \mathbf{o} + s_k^{(r)}\mathbf{d}$ and predicts a shift bounded by $45\%$ of its distance to its nearest neighbor (and by $d_{\max}$):
+   $$\text{room}_k = 0.45 \cdot \min\big(s_k^{(r)} - s_{k-1}^{(r)},\; s_{k+1}^{(r)} - s_k^{(r)}\big)$$
+   $$\delta s_k = \tanh(u_k) \cdot \min(\text{room}_k,\, d_{\max})$$
+3. **Order-Preserving Update (No Sorting Needed):**
+   $$s_k^{(r+1)} = s_k^{(r)} + \delta s_k$$
+   - Because two adjacent knots can move toward each other by at most $45\% + 45\% = 90\%$ of the gap between them and the boundary knots are pinned, strict monotonicity ($s_{\min} = s_0 < s_1 < \dots < s_{K-1} = s_{\max}$) holds automatically without sorting or clamping, and knots cannot collapse onto each other or drift away from the boundaries.
    - Knots in empty air stay uniformly spaced because they experience zero gradient pulling them away.
-   - Knots adjacent to physical obstacle boundaries feel the continuous L2 CRPS gradient and actively shift toward the step, tightly sandwiching the surface transition into a knife-sharp step.
-4. **Iterative Refinement:** Round $r+1$ re-evaluates the scene at the refined knot positions $s^{(r+1)}$, allowing knots to lock onto surface discontinuities with millimeter precision without any hacky auxiliary loss functions.
+   - Knots adjacent to physical obstacle boundaries feel the continuous Root-CRPS gradient and shift toward the step, bracketing the surface transition tightly.
+4. **Iterative Refinement (Stop-Gradient Between Rounds):** Round $r+1$ detaches $s^{(r+1)}$ (`s_knots.detach()`) and re-evaluates the 3D positional features at the refined knot locations, iteratively tightening surface transitions.
 
 ### Guaranteed Monotonicity by Construction
 
 Monotonicity is never left to the loss function to learn by trial and error. It is guaranteed mathematically:
 
-1. **Knot Distance Ordering ($s_1 < s_2 < \dots < s_K$):**
-   $$\Delta s_k = s_k^{(r+1)} - s_{k-1}^{(r+1)} \ge 0 \qquad (\text{with } s_0 = s_{\min})$$
-   Because $s_k^{(r+1)}$ is passed through $\operatorname{sort}$, knots are strictly sorted along the beam and can never invert or cross.
+1. **Strict Knot Ordering ($s_{\min} = s_0 < s_1 < \dots < s_{K-1} = s_{\max}$):**
+   Guaranteed directly by pinned endpoints and the $0.45\times$ nearest-neighbor gap bound—knots can never invert, cross, or escape $[s_{\min}, s_{\max}]$.
 
-2. **CDF Monotonicity ($0 \le C_1 \le C_2 \le \dots \le C_K \le 1.0$):**
-   The optical hazard added over segment $k$ is the product of density and segment length:
-   $$\Delta A_k = \lambda_k \cdot \Delta s_k \ge 0$$
-   $$\text{Cumulative Hazard: } A_k = \sum_{j \le k} \Delta A_j \qquad \Longrightarrow \qquad C_k = 1 - e^{-A_k}$$
-   - **Monotonicity:** Because $\Delta A_k \ge 0$, $A_k$ monotonically increases, $e^{-A_k}$ monotonically decreases, and $C_k = 1 - e^{-A_k}$ is **strictly monotonic increasing**.
-   - **Bounds:** When $A_k = 0 \implies C_k = 0$; as $A_k \to \infty \implies C_k \to 1.0$.
-   - **No Double-Counting:** If knots cluster together ($\Delta s_k \to 0$), the added hazard $\Delta A_k \to 0$. Moving knots increases local spatial resolution without artificially inflating return probability.
-   - **Natural Sky/Misses:** If a ray escapes to infinity through empty space, all $\lambda_k = 0 \implies C_k = 0$ everywhere along the ray.
+2. **CDF Monotonicity ($0 = C_0 \le C_1 \le \dots \le C_{K-1} \le 1.0$):**
+   - **Default Interval Softmax Mode (`cdf_mode="softmax"`):**
+     $$w_{1 \dots K-1} = \operatorname{softmax}\big([v_1, \dots, v_{K-1},\; 0.0]\big)_{1 \dots K-1}, \qquad C_0 = 0, \quad C_k = \sum_{j=1}^{k} w_j$$
+     - **Monotonicity & Bounds:** Because $w_j \ge 0$ and $\sum_{j=1}^{K-1} w_j \le 1$, $C_k$ is strictly non-decreasing and bounded in $[0, 1]$.
+     - **Escape Bin for Non-Returns / Partial Transmission:** The fixed `0.0` escape logit absorbs probability mass for rays that transmit past $s_{\max}$ without returning, while the dedicated `ray_drop_head` explicitly predicts $p_{\text{hit}}$.
+   - **Legacy Hazard Integration Mode (`cdf_mode != "softmax"`):**
+     $$\Delta A_k = \lambda_k \cdot \max(s_k - s_{k-1}, 10^{-4}) \ge 0, \qquad C_k = 1 - e^{-\sum_{j \le k} \Delta A_j}$$
+     Preserves Beer–Lambert physical quadrature and avoids double-counting when knots cluster ($\Delta s_k \to 0 \implies \Delta A_k \to 0$).
 
-### Knot Handling: Training vs. Render Time
+### Loss, Training & Inference
 
-- **The Knots are the Network's Internal Spline Parameterization:** The training data target is simply the observed LiDAR data (the measured range step $H(t - d)$ or ground-truth continuous CDF $\text{CDF}^*(t)$). The network learns on its own where to position its knots to minimize the CRPS loss.
+- **Exact Grid-Free Analytic Loss (`exact_continuous_cdf_loss` / `compute_sck_loss`):**
+  - Instead of resampling onto a discrete range grid, the piecewise-linear spline CDF is integrated analytically in closed form against the exact LiDAR step target $\mathbf{1}_{t \ge r^*}$ (inserting $(r^*, F(r^*))$ into the knot list).
+  - Computes exact continuous L1 (Wasserstein-1 via trapezoids, logged as a metric) and exact continuous L2 (CRPS via piecewise-quadratic integration).
+  - **Root-CRPS Objective:** In grid-free mode, each round optimizes **Root-CRPS** ($\sqrt{\mathcal{L}_{\text{CRPS}} + 10^{-6}}$) masked strictly to hitting rays (`hit_mask > 0`), with geometric round weights $w_r = 0.5^{R - 1 - r}$ (RAFT-style). L1 is intentionally excluded from the gradient because Wasserstein-1 causes the model to skip semi-transparent surfaces.
+  - **Ray-Drop Supervision:** Binary cross-entropy on `p_hit` vs. `hit_mask`, weighted by `lambda_raydrop`.
+  - *(A discrete-grid fallback mode evaluating weighted L1 + L2 against `gt_cdf` on `eval_grid` is also retained when `hit_range` is not supplied).*
 - **Identical Starting State at Train & Render Time:**
-  - **Round 0:** Knots always start with uniform spacing $s_k^{(0)} = \operatorname{linspace}(s_{\min}, s_{\max}, K)$ and $C_k^{(0)} = 0$.
-  - **Rounds $1 \dots R$ (Refinement):** The network updates knot positions and densities.
-  - **Training:** Unroll $R \approx 2\text{--}3$ steps with increasing loss weights on intermediate rounds (RAFT-style) so the model learns both coarse discovery from uniform spacing and fine snapping near surfaces.
-  - **Render Time:** Start from uniform $s^{(0)}$ and iterate $R$ times to converge directly onto the step jumps.
+  - **Round 0:** Knots always start uniformly spaced on $[s_{\min}, s_{\max}]$.
+  - **Rounds $1 \dots R$:** The network refines knot positions and CDF values (default $R = 2$ in `DeeperSCKNetwork`, typically $R = 2\text{--}3$).
+- **Point Cloud Synthesis (`generate_point_cloud_from_network`):**
+  - Prunes rays whose predicted non-return probability $1 - p_{\text{hit}}$ exceeds `non_return_threshold` (default `0.5`).
+  - Inverts the piecewise-linear CDF via `torch.searchsorted` using either `"threshold"` (median/quantile depth where $C(s^*) = \tau$, default `0.5`) or `"sample"` (stochastic inverse-CDF sampling $u \sim \mathcal{U}[0, 1]$, dropping rays with $u > C_{\max}$), then projects $\mathbf{p} = \mathbf{o} + s^*\mathbf{d}$.
 
 ### Why Grounding in World XYZ Enforces Multi-View Consistency
 
 - **In Ray-Space:** Two rays from different sensor poses $\mathbf{o}_A$ and $\mathbf{o}_B$ that hit the same obstacle have completely different $(\mathbf{o}, \mathbf{d})$ and different scalar distances $s_A \ne s_B$. Ray space alone provides no coordinate system to recognize they observe the same obstacle.
 - **In World XYZ:** Both rays intersect at the **exact same 3D coordinate**:
   $$\mathbf{x} = \mathbf{o}_A + s_A \mathbf{d}_A = \mathbf{o}_B + s_B \mathbf{d}_B \quad \in \mathbb{R}^3$$
-- **Consistency by Construction:** By feeding the 3D location $\mathbf{x}_k \in \mathbb{R}^3$ into the self-conditioning loop, all viewpoints query the same shared spatial field $h(\mathbf{x})$ and attend to one another in world metric space. Furthermore, empty space along one view directly carves false knots from crossing views.
+- **Consistency by Construction:** By feeding the 3D location $\mathbf{x}_k \in \mathbb{R}^3$ into the self-conditioning loop, all viewpoints query the same shared spatial encoder in world metric space. Furthermore, empty space along one view directly carves false returns from crossing views.
 
-### Origin-Sliding Data Augmentation
+### Origin-Sliding Data Augmentation (`vectorized_gpu_origin_slide`)
 
-Along any ray that has its first interaction at distance $d$, the line segment $[0, d)$ is completely empty space ($\text{CDF} = 0, T = 1$).
+Along any hitting ray whose return occurs at distance $r^*$, the line segment $[0, r^*)$ is empty space ($\text{CDF} = 0, T = 1$).
 
-We augment training rays by sliding the sensor forward along the ray by $\Delta \in [0, d)$:
-$$\mathbf{o}' = \mathbf{o} + \Delta \cdot \mathbf{d}, \qquad \mathbf{d}' = \mathbf{d}$$
+During training (optional via `augment_origin_slide=True`), hitting rays are stochastically augmented (default `prob=0.5`) by sliding the sensor forward along the ray by $\Delta \sim \mathcal{U}[0, \text{max\_slide} \cdot r^*]$ (default `max_slide=0.7`):
+$$\mathbf{o}' = \mathbf{o} + \Delta \cdot \mathbf{d}, \qquad \mathbf{d}' = \mathbf{d}, \qquad r' = r^* - \Delta$$
 
 - **Plücker Invariance:** The Plücker coordinates $(\mathbf{d}, \mathbf{m})$ of the infinite line are invariant under this translation because $(\Delta \mathbf{d}) \times \mathbf{d} = 0$.
-- **Exact CDF Shift:** The obstacle is now at distance $d' = d - \Delta$, and the ground-truth CDF shifts identically:
+- **Exact CDF Shift:** The obstacle is now at distance $r' = r^* - \Delta$, and the ground-truth CDF shifts identically:
   $$\text{CDF}_{\mathbf{o}'}(t) = \text{CDF}_{\mathbf{o}}(t + \Delta)$$
-- **Near-Field Generalization:** This allows the network to learn near-field, mid-range, and far-field obstacle CDFs from the exact same physical ray without collecting new scans or running extra collision tests.
+- **Near-Field Generalization:** Allows the network to learn near-field, mid-range, and far-field obstacle CDFs from the same physical ray directly on GPU without collecting new scans or running extra collision tests.
 
 ### Synthetic Data Pipeline (`synthetic_data_generation_utils.py`)
 
 A modular simulation utility is implemented in `synthetic_data_generation_utils.py` to evaluate SCK:
-- **`LidarProjectionModel`**: Configurable vertical detectors (e.g. 16, 32, 64) and azimuthal resolution.
-- **`Scene` Primitives**: Boxes, spheres, and cylinders with user-specified volumetric return density per meter $\lambda$.
-- **Volumetric Penetration**: Rays entering porous objects (e.g. tree canopies) penetrate into the volume with depths sampled from the truncated exponential distribution $s \sim \lambda e^{-\lambda s}$, while solid surfaces ($\lambda \ge 100$) return immediately at the boundary.
-- **`generate_multiview_dataset`**: Automatically captures multi-view trajectories (e.g. orbit or grid poses) and exports rays $(\mathbf{o}, \mathbf{d})$, Plücker vectors $(\mathbf{d}, \mathbf{m})$, point clouds, and ground-truth continuous $\text{CDF}(t)$ values for supervision.
-
+- **`LidarProjectionModel`**: Configurable vertical detectors (e.g. 16, 32, 64), elevation/azimuth bounds, and range limits.
+- **`Scene` Primitives**: `Box` (axis-aligned or oriented), `Sphere`, and `Cylinder` primitives with user-specified volumetric return density per meter $\lambda$.
+- **Volumetric Penetration**: Rays entering porous objects (e.g. tree canopies / low-density spheres) penetrate into the volume with depths sampled from the truncated exponential distribution $s \sim \lambda e^{-\lambda s}$, while solid surfaces ($\lambda \ge 100$) return near the boundary.
+- **`generate_point_cloud` & `generate_multiview_dataset`**: Traces rays with exact Beer–Lambert transmittance across multiple surfaces, supports `return_misses=True` for `hit_mask` supervision, and exports rays $(\mathbf{o}, \mathbf{d})$, Plücker vectors $(\mathbf{d}, \mathbf{m})$, point clouds, `sensor_poses`, and optional ground-truth continuous $\text{CDF}(t)$ values (`query_cdf_along_ray`).
 ---
 
 ## 1. What additivity actually gives you

@@ -7,12 +7,16 @@ This module provides:
   1. Network Structure:
      - PositionalEncoding: Scene-scaled vectorized sinusoidal coordinate encoder.
      - DeeperSCKNetwork (alias SCKNetwork): Recurrent / self-conditioned knot network
-       with residual knot flow displacements, volumetric density heads, and a dedicated
-       ray-drop classification head (PLiNK architecture).
+       with gap-bounded residual knot flow displacements, interval-softmax (default) or
+       legacy volumetric-density CDF heads, and a dedicated ray-drop classification head
+       (PLiNK architecture).
   2. Loss Calculation:
      - interpolate_cdf_to_grid: Piecewise linear CDF evaluation on a fixed query grid (F.pad).
-     - compute_sck_loss / SCKLoss: PLiNK-style masked continuous CDF loss (evaluated strictly
-       on hitting rays) + binary cross-entropy ray-drop loss + optional L1 Wasserstein term.
+     - exact_continuous_cdf_loss: Exact closed-form continuous L1 (Wasserstein-1) and L2
+       (CRPS) integrals over piecewise-linear spline CDFs.
+     - compute_sck_loss / SCKLoss: PLiNK-style masked continuous CDF loss (Root-CRPS in
+       exact grid-free mode, or weighted L1+L2 in discrete grid fallback mode) evaluated
+       strictly on hitting rays + binary cross-entropy ray-drop loss.
   3. Dataset & Fast GPU Batcher:
      - LidarRayDataset: PyTorch Dataset for rays with GPU support and hit_mask tracking.
      - GPURayBatcher: Ultra-fast zero-copy batcher for rays stored directly in GPU memory.
@@ -102,6 +106,8 @@ class DeeperSCKNetwork(nn.Module):
         num_hidden_blocks: Number of residual MLP blocks in decoder trunk.
         num_rounds: Number of self-conditioning refinement iterations R.
         max_displacement: Maximum knot shift distance per round (meters).
+        cdf_mode: CDF parameterization mode: "softmax" (default, interval return logits
+            with an escape bin) or legacy Beer-Lambert volumetric density integration.
     """
 
     def __init__(
@@ -438,11 +444,13 @@ def compute_sck_loss(
 
     Supports two modes:
       1. Exact Grid-Free Mode (Recommended):
-         When hit_range (r*) is provided, computes exact closed-form Wasserstein-1 and
-         CRPS integrals via trapezoids with ZERO discretization error. No eval_grid needed!
+         When hit_range (r*) is provided, computes exact closed-form Wasserstein-1 (logged
+         as metric) and CRPS (L2) integrals over the piecewise-linear spline with ZERO
+         discretization error, optimizing Root-CRPS (sqrt(l2_round + 1e-6)) per round.
+         No eval_grid needed!
       2. Discrete Grid Mode (Fallback):
          When gt_cdf and eval_grid are provided without hit_range, resamples predicted
-         knots onto eval_grid.
+         knots onto eval_grid and optimizes l2_weight * L2 + l1_weight * L1.
 
     Args:
         round_outputs: List of (s_round, c_round) tuples from model forward pass.
@@ -452,9 +460,10 @@ def compute_sck_loss(
         p_hit: Predicted hit probability from ray_drop_head, shape (B, 1) or (B,).
         hit_mask: Ground truth hit mask (1.0 = hit, 0.0 = ray-drop/sky), shape (B,) or (B, 1).
         dt: Grid step size (only used in discrete grid fallback mode).
-        weights: Optional custom list of weights for each self-conditioning round.
-        l1_weight: Weight for Wasserstein-1 L1 term.
-        l2_weight: Weight for continuous L2 / CRPS term.
+        weights: Optional custom list of weights for each self-conditioning round
+            (defaults to geometric decay [0.5^(R-1-i)]).
+        l1_weight: Weight for Wasserstein-1 L1 term (discrete grid fallback mode only).
+        l2_weight: Weight for continuous L2 / CRPS term (discrete grid fallback mode only).
         lambda_raydrop: Weight for the binary cross-entropy ray-drop loss.
         s_max: Far bound for scene ray distances (meters).
 
@@ -855,8 +864,8 @@ def train_step(
         dt: Step size of eval_grid (only for discrete grid mode).
         device: Torch device. If None, derived from model parameter device.
         augment_origin_slide: If True, applies vectorized GPU origin sliding.
-        l1_weight: Weight for linear Wasserstein loss term.
-        l2_weight: Weight for continuous L2 / CRPS loss term.
+        l1_weight: Weight for linear Wasserstein loss term (discrete grid fallback mode only).
+        l2_weight: Weight for continuous L2 / CRPS loss term (discrete grid fallback mode only).
         lambda_raydrop: Weight for ray-drop classification loss.
         s_max: Maximum scene range.
 
@@ -944,8 +953,8 @@ def train_epoch(
         dt: Optional step size of eval_grid.
         device: Torch device.
         augment_origin_slide: Whether to apply vectorized GPU origin sliding.
-        l1_weight: Weight for Wasserstein-1 L1 term.
-        l2_weight: Weight for continuous L2 / CRPS term.
+        l1_weight: Weight for Wasserstein-1 L1 term (discrete grid fallback mode only).
+        l2_weight: Weight for continuous L2 / CRPS term (discrete grid fallback mode only).
         lambda_raydrop: Weight for ray-drop classification loss.
         s_max: Maximum scene range.
 
@@ -1006,8 +1015,8 @@ def train_model(
         verbose: If True, prints epoch progress.
         callback: Optional callback fn(epoch, avg_loss) called after each epoch.
         augment_origin_slide: If True, applies fast vectorized GPU origin sliding.
-        l1_weight: Weight for linear Wasserstein-1 L1 loss term.
-        l2_weight: Weight for continuous L2 / CRPS term.
+        l1_weight: Weight for linear Wasserstein-1 L1 loss term (discrete grid fallback mode only).
+        l2_weight: Weight for continuous L2 / CRPS term (discrete grid fallback mode only).
         lambda_raydrop: Weight for ray-drop classification loss.
         s_max: Maximum scene range.
 

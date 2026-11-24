@@ -1437,16 +1437,19 @@ def generate_multiview_dataset(
     Returns
     -------
     dataset : dict of numpy arrays:
-        - 'rays_o': (total_points, 3) or per-ray origins
-        - 'rays_d': (total_points, 3) unit ray directions
-        - 'plucker_d': (total_points, 3) Plücker direction
-        - 'plucker_m': (total_points, 3) Plücker moment (o x d)
         - 'points': (total_points, 3) 3D return coordinates
         - 'ranges': (total_points,) distances to returns
         - 'probabilities': (total_points,) return probabilities
+        - 'normals': (total_points, 3) surface normals at contact points
+        - 'rays_o': (total_points, 3) per-return ray origins
+        - 'rays_d': (total_points, 3) unit ray directions
+        - 'plucker_d': (total_points, 3) Plücker direction
+        - 'plucker_m': (total_points, 3) Plücker moment (o x d)
+        - 'plucker': (total_points, 6) concatenated [plucker_d, plucker_m]
         - 'pose_indices': (total_points,) index of sensor pose (0 to P-1)
-        - 'poses': (P, 4, 4) SE(3) sensor transformation matrices
+        - 'sensor_poses': (P, 4, 4) SE(3) sensor transformation matrices
         - 'cdf_knots': (P * rays, K) ground-truth CDF values (if evaluate_cdf_knots is given)
+        - 'knot_distances': (K,) evaluation knot distances (if evaluate_cdf_knots is given)
     """
     if random_seed is not None:
         np.random.seed(random_seed)

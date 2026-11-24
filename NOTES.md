@@ -42,37 +42,39 @@ Consider local batching for more efficient learning of CDFs?
 
 ### Architectural Note: Shared-Weight Knot Flow (PointNet along a 1D Light Ray)
 
-The SCK knot refinement decoder is structurally identical to a **PointNet evaluated along a 1D ray manifold**:
+The SCK knot refinement decoder (`DeeperSCKNetwork` in `sck_model.py`) is structurally identical to a **PointNet evaluated along a 1D ray manifold**, plus a PLiNK-style global ray-drop head:
 
 1. **Global Ray Context (PointNet Global Feature)**:
-   - Evaluated once per ray: $(\mathbf{o}, \mathbf{d}, \mathbf{m} = \mathbf{o} \times \mathbf{d}) \xrightarrow{\text{PE + MLP}} \mathbf{f}_{\text{ray}} \in \mathbb{R}^{\text{hidden\_dim}}$.
+   - Evaluated once per ray: $(\mathbf{o}, \mathbf{d}, \mathbf{m} = \mathbf{o} \times \mathbf{d}) \xrightarrow{\text{PE (10 freqs) + MLP}} \mathbf{f}_{\text{ray}} \in \mathbb{R}^{\text{hidden\_dim}}$.
+   - A dedicated `ray_drop_head` evaluates $\mathbf{f}_{\text{ray}} \to p_{\text{hit}} \in [0, 1]$ to classify hitting vs. sky/non-return rays.
 2. **Local Knot Features (PointNet Local Point Feature)**:
-   - For every knot $k \in \{1, \dots, K\}$, 3D point $\mathbf{x}_k = \mathbf{o} + s_k \mathbf{d} \xrightarrow{\text{PE + MLP}} \mathbf{f}_{\text{knot}, k} \in \mathbb{R}^{\text{hidden\_dim}}$.
+   - For every knot $k \in \{0, \dots, K-1\}$, 3D point $\mathbf{x}_k = \mathbf{o} + s_k \mathbf{d} \xrightarrow{\text{PE (10 freqs) + MLP}} \mathbf{f}_{\text{knot}, k} \in \mathbb{R}^{\text{hidden\_dim}}$.
 3. **Global + Local Concatenation**:
    - Ray context is broadcast to every candidate knot: $[\mathbf{f}_{\text{ray}}, \mathbf{f}_{\text{knot}, k}] \in \mathbb{R}^{2 \cdot \text{hidden\_dim}}$.
-4. **Shared MLP Trunk (PointNet 1x1 Shared Convolution)**:
-   - Evaluates all knots simultaneously using the **exact same shared weights** across $K$:
-     $$(\Delta s_k, \sigma_k) = \text{MLP}_{\text{shared}}([\mathbf{f}_{\text{ray}}, \mathbf{f}_{\text{knot}, k}])$$
-5. **1D Light Ray Transmittance Constraint**:
-   - Unlike standard PointNet where points are unordered, the knots interact via the physics of light travel:
-     - Differentiable 1D spatial sort: $s_{(0)} \le s_{(1)} \le \dots \le s_{(K)}$ (permutes densities accordingly).
-     - Monotonic Beer-Lambert integration: $C(s) = 1 - \exp(-\sum \sigma_k \Delta s_k)$.
+4. **Shared Residual MLP Trunk (PointNet 1x1 Shared Convolution)**:
+   - Evaluates all knots simultaneously using the **exact same shared weights** across $K$ (`joint_in` + `num_hidden_blocks` residual ReLU blocks + `out_head`):
+     $$(u_k, v_k) = \text{MLP}_{\text{shared}}([\mathbf{f}_{\text{ray}}, \mathbf{f}_{\text{knot}, k}])$$
+5. **1D Monotonic Knot Flow & CDF Construction**:
+   - **Order-Preserving Gap-Bounded Shifts (No Sorting Needed)**: Endpoints stay pinned at $s_0 = s_{\min}$ and $s_{K-1} = s_{\max}$. Each interior knot shifts by $\delta s_k = \tanh(u_k) \cdot \min(0.45 \min(\Delta s_k^{\text{left}}, \Delta s_k^{\text{right}}), d_{\max})$, guaranteeing strict monotonic ordering and preventing knot bunching without sorting. Refined knot positions are detached (`s_knots.detach()`) between rounds.
+   - **Default Interval Softmax CDF (`cdf_mode="softmax"`)**: Predicts probability mass per interval $[s_{k-1}, s_k]$ via softmax over $v_1, \dots, v_{K-1}$ plus a fixed `0.0` escape bin logit, cumulatively summed from $C_0 = 0$ at $s_{\min}$. Avoids exponential density saturation and vanishing gradients.
+   - **Legacy Beer–Lambert Mode (`cdf_mode != "softmax"`)**: Integrates $\lambda_k = \operatorname{softplus}(v_k)$ via $C_k = 1 - \exp(-\sum \lambda_j \max(\Delta s_j, 10^{-4}))$.
 
 **Key Advantages**:
 - **Knot-Count Agnostic ($K$ is not in the weight matrix)**: Linear layers operate strictly on the trailing feature dimension. The model parameter count is completely independent of $K$.
-- **True Continuous Field / Spatial Generalization**: The network never memorizes "knot index #5 at 2.0 meters"; it learns a unified 3D vector field $\vec{v}(x, y, z) = (\text{shift}, \text{density})$.
+- **True Continuous Field / Spatial Generalization**: The network never memorizes "knot index #5 at 2.0 meters"; it learns a unified shared per-knot update over world coordinates and ray context.
 - **Resolution Flexibility**: Can train efficiently with $K=16$ or $K=32$ knots for fast epoch throughput, and evaluate/render with arbitrary $K$ at test time without altering model weights.
 
 ---
 
-### Architectural Note: Exact Grid-Free Analytic Loss (Closed-Form Wasserstein-1 & CRPS)
+### Architectural Note: Exact Grid-Free Analytic Loss (Closed-Form Root-CRPS & Wasserstein-1)
 
-Instead of discretizing space with an artificial evaluation grid (e.g. 64 or 256 ticks), the continuous CDF loss against a LiDAR return at $r^*$ is computed **analytically in closed form**:
-$$\mathcal{L} = \int_{0}^{s_{\max}} \left| F_{\text{spline}}(t) - \mathbf{1}_{t \ge r^*} \right| dt = \int_0^{r^*} F(t) dt + \int_{r^*}^{s_{\max}} (1 - F(t)) dt$$
+Instead of discretizing space with an artificial evaluation grid (e.g. 64 or 256 ticks), `exact_continuous_cdf_loss` computes the continuous CDF error against a LiDAR return at $r^*$ **analytically in closed form** by inserting $(r^*, F(r^*))$ into the piecewise-linear spline knots:
+$$\mathcal{L}_1 = \int_{0}^{s_{\max}} \left| F_{\text{spline}}(t) - \mathbf{1}_{t \ge r^*} \right| dt, \qquad \mathcal{L}_2 = \int_{0}^{s_{\max}} \left( F_{\text{spline}}(t) - \mathbf{1}_{t \ge r^*} \right)^2 dt$$
 
-- **Polygon Trapezoids**: Because $F_{\text{spline}}$ is piecewise-linear, the exact integral over each segment $[s_{k-1}, s_k]$ is given by simple trapezoids $\frac{c_{k-1} + c_k}{2} \Delta s_k$ (and exact quadratic polynomials for continuous $L_2$).
+- **Exact Piecewise Integration**: Because $F_{\text{spline}}$ is piecewise-linear, $\mathcal{L}_1$ (Wasserstein-1) is exact via trapezoids $\frac{e_l + e_r}{2} \Delta s$ and $\mathcal{L}_2$ (CRPS) is exact via piecewise-quadratic integrals $\frac{\Delta s}{3}(e_l^2 + e_l e_r + e_r^2)$.
+- **Root-CRPS Training Objective**: In grid-free mode, `compute_sck_loss` optimizes **Root-CRPS** $\sqrt{\mathcal{L}_2 + 10^{-6}}$ per round (masked strictly to hitting rays via `hit_mask`, with geometric round weights $0.5^{R - 1 - r}$) plus BCE ray-drop loss on `p_hit`. L1 is logged as a metric only, because optimizing L1 causes the network to skip semi-transparent surfaces.
 - **Zero Discretization Error**: Has infinite effective spatial resolution ($0.0\,\text{mm}$ error), eliminating the surface-snapping blind spots caused by discrete grids.
-- **Memory & Compute Efficiency**: Eliminates storing or loading pre-computed $(N, M)$ CDF matrices in VRAM and removes `interpolate_cdf_to_grid` from the inner training loop. Origin sliding simply computes $r^* \leftarrow r^* - \delta$.
+- **Memory & Compute Efficiency**: Eliminates storing or loading pre-computed $(N, M)$ CDF matrices in VRAM and removes `interpolate_cdf_to_grid` from the inner training loop. Origin sliding simply computes $r^* \leftarrow r^* - \Delta$.
 
 ---
 
@@ -89,10 +91,9 @@ To maximize training throughput on resource-constrained hardware (e.g. NVIDIA GT
    - Increasing batch size to $B=1024$ takes virtually identical execution time per step ($35.8\,\text{ms/step}$) while shoveling $4\times$ more rays per step, pushing throughput to **$>20,000\,\text{rays/sec}$** ($3.8\times$ real throughput gain).
 
 3. **`torch.compile` CUDA Kernel Fusion**:
-   - Compiling `DeeperSCKNetwork` via PyTorch 2.x Inductor fuses positional encodings, layer norms, and MLP activations into unified Triton CUDA kernels.
+   - Compiling `DeeperSCKNetwork` via PyTorch 2.x Inductor fuses positional encodings, linear layers, and MLP activations into unified Triton CUDA kernels.
    - Forward pass latency drops from $15.1\,\text{ms}$ to $8.4\,\text{ms}$ ($1.8\times$ faster).
 
 4. **Precision Considerations (FP32 vs FP16 AMP)**:
-   - For compact coordinate networks ($\sim 17\text{k} - 48\text{k}$ parameters), standard FP32 runs faster than FP16 Automatic Mixed Precision (AMP).
-   - In micro-networks, the kernel launching overhead of dtype casting and loss scaling (`GradScaler`) outweighs any tensor-core savings. Pure FP32 minimizes latency while preserving gradient precision for positional encodings.
-
+   - For compact coordinate MLPs, standard FP32 runs faster than FP16 Automatic Mixed Precision (AMP) on mobile GPUs.
+   - The kernel launching overhead of dtype casting and loss scaling (`GradScaler`) outweighs tensor-core savings, and pure FP32 preserves gradient precision for high-frequency positional encodings.
