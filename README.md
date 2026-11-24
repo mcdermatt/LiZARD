@@ -1,6 +1,20 @@
 # LiZARD
 Exploring LiDAR-Based Neural Hazard Fields
 
+## TODO:
+
+* make online 3D visualization for trainig (alternative to jupyter notebook)
+
+* try instant-ngp hash encoding
+
+* tune network sizes
+
+* view-dependant reflectivity?
+
+* Point-Net Front end-- this vs transformer?
+
+* Switch compact `H=64` MLPs in `HashSCKNetwork` to `tcnn.FullyFusedMLP` (FP16 Tensor Core fused MLP) on Ampere+ GPUs (e.g. RTX 3090, where CUDA toolkit/`nvcc` is available) — ~62% of `HashSCKNetwork` step time is currently spent in the small PyTorch MLPs rather than the Triton hash grid. Note: keep FP32 cast before softmax/Root-CRPS loss, pad batch sizes to multiples of 128, and verify `dL/dx` input-gradient support if also switching `HashGrid3D` to `tcnn`.
+
 ## Summary
 
 1. **Exact segment additivity is easy, but it isn't the hard problem.** If $A$ is written as a monotone per-line potential $\Phi(\ell,t)$, you get nonnegativity, monotonicity, $A(\mathbf a,\mathbf a)=0$, additivity and reversal symmetry by construction. No regularization is needed, and the network runs once per ray: every query distance is then closed-form.
@@ -59,7 +73,7 @@ The network iteratively refines $K$ knots along each ray via **self-conditioning
 2. **Dedicated Ray-Drop Head (PLiNK-style):** Evaluates $\mathbf{f}_{\text{ray}}$ through a 2-layer MLP + sigmoid (`ray_drop_head`, initialized with bias `2.0`, ~88% hit prior) to predict hit probability $p_{\text{hit}} \in [0, 1]$, cleanly separating hitting rays from non-returning sky rays.
 3. **$K$ Candidate Knots in World Space:**
    $$\mathbf{x}_k = \mathbf{o} + s_k \mathbf{d} \quad \in \mathbb{R}^3$$
-   where $s_k \in [s_{\min}, s_{\max}]$ is the distance along the ray, encoded via 10-band sinusoidal positional encoding and `knot_in`, concatenated with $\mathbf{f}_{\text{ray}}$, and passed through a residual MLP trunk (`joint_in` + `num_hidden_blocks` residual blocks).
+   where $s_k \in [s_{\min}, s_{\max}]$ is the distance along the ray, encoded via 10-band sinusoidal positional encoding and `knot_in`, fused with pre-projected $\mathbf{f}_{\text{ray}}$ via split linear layers (`ray_proj` computed once per ray + `knot_proj` per knot), and passed through a residual MLP trunk (`num_hidden_blocks` residual blocks).
 
 *(Note: Prior CDF values are intentionally **not** passed into the network. Only geometric coordinates $\mathbf{x}_k$ are fed into the refinement loop, preventing feedback error accumulation and keeping self-conditioning purely geometric).*
 
@@ -143,6 +157,12 @@ $$\mathbf{o}' = \mathbf{o} + \Delta \cdot \mathbf{d}, \qquad \mathbf{d}' = \math
 - **Exact CDF Shift:** The obstacle is now at distance $r' = r^* - \Delta$, and the ground-truth CDF shifts identically:
   $$\text{CDF}_{\mathbf{o}'}(t) = \text{CDF}_{\mathbf{o}}(t + \Delta)$$
 - **Near-Field Generalization:** Allows the network to learn near-field, mid-range, and far-field obstacle CDFs from the same physical ray directly on GPU without collecting new scans or running extra collision tests.
+
+### Hash-Grid SCK Implementation (`hash_sck_model.py`)
+
+A second, self-contained Instant-NGP-style implementation (`HashSCKNetwork` + `HashGrid3D`) is provided in `hash_sck_model.py`:
+- **Fused Triton 3D Multi-Resolution Hash Grid (`HashGrid3D`):** Moves scene capacity into a 12-level 3D spatial hash table (`~6.3 MB` at `log2_hashmap_size=16`, `n_features=2`), shrinking the per-knot decoder to `hidden_dim=64` (~36k MLP params). Computes exact forward lookups and backward gradients for **both** hash table entries (`dL/dtable`) and 3D coordinates (`dL/dx`) in fused Triton kernels, with automatic fallback to `tinycudann` (if installed) or pure PyTorch.
+- **Architectural Refinements:** Uses origin-invariant Plücker ray features $(\mathbf{d}, \mathbf{m})$, evaluates the CDF head at **shifted interval midpoints** (with optional pure-3D readout `local_cdf=True` and $\log(\Delta s_k)$ width bias in softmax mode), grounds `ray_drop_head` in pooled 3D midpoint features, and adds sky empty-space carving (`lambda_sky_cdf`) with a zero-sync GPU training loop (`train_hash_sck_model`).
 
 ### Synthetic Data Pipeline (`synthetic_data_generation_utils.py`)
 

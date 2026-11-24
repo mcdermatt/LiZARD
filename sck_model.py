@@ -145,7 +145,9 @@ class DeeperSCKNetwork(nn.Module):
         )
 
         # 2. Deeper residual decoder trunk
-        self.joint_in = nn.Linear(hidden_dim * 2, hidden_dim)
+        # Split joint projection so ray_feat is projected ONCE per ray (not K*R times)
+        self.ray_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.knot_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.res_blocks = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
@@ -169,6 +171,12 @@ class DeeperSCKNetwork(nn.Module):
         )
 
         # Initial biases
+        self._init_custom_biases()
+
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"Total model parameters: {total_params:,}")
+
+    def _init_custom_biases(self) -> None:
         with torch.no_grad():
             self.out_head.bias[0].fill_(0.0)
             if self.cdf_mode == "softmax":
@@ -177,12 +185,28 @@ class DeeperSCKNetwork(nn.Module):
                 self.out_head.bias[1].fill_(-4.0)
             self.ray_drop_head[-1].bias.fill_(2.0)  # Initial prior: ~88% hit rate
 
-        total_params = sum(p.numel() for p in self.parameters())
-        print(f"Total model parameters: {total_params:,}")
+    def reset_weights(self, seed: Optional[int] = None) -> None:
+        """Resets all network parameters in-place without triggering torch.compile recompilation.
+
+        Works seamlessly whether called directly on DeeperSCKNetwork or on a torch.compile()-wrapped instance.
+
+        Args:
+            seed: Optional random seed for reproducible re-initialization.
+        """
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+
+        with torch.no_grad():
+            for module in self.modules():
+                if module is not self and hasattr(module, "reset_parameters"):
+                    module.reset_parameters()
+            self._init_custom_biases()
 
     def forward_single_pass(
         self,
-        ray_feat: torch.Tensor,
+        ray_proj_feat: torch.Tensor,
         ray_o: torch.Tensor,
         ray_d: torch.Tensor,
         s_knots: torch.Tensor,
@@ -190,7 +214,7 @@ class DeeperSCKNetwork(nn.Module):
         """Executes a single round of knot refinement and CDF calculation.
 
         Args:
-            ray_feat: Precomputed ray features, shape (B, hidden_dim).
+            ray_proj_feat: Pre-projected global ray features, shape (B, hidden_dim).
             ray_o: Ray origins, shape (B, 3).
             ray_d: Ray directions, shape (B, 3).
             s_knots: Current knot distances along rays, shape (B, K).
@@ -207,9 +231,8 @@ class DeeperSCKNetwork(nn.Module):
         x_knots = ray_o.unsqueeze(1) + s_knots.unsqueeze(-1) * ray_d.unsqueeze(1)
         knot_feat = F.relu(self.knot_in(self.pos_enc_x(x_knots)))
 
-        # Joint features through residual trunk
-        ray_feat_expanded = ray_feat.unsqueeze(1).expand(-1, K, -1)
-        h = F.relu(self.joint_in(torch.cat([ray_feat_expanded, knot_feat], dim=-1)))
+        # Joint features through residual trunk (ray_proj_feat already projected once per ray)
+        h = F.relu(ray_proj_feat.unsqueeze(1) + self.knot_proj(knot_feat))
 
         for block in self.res_blocks:
             h = F.relu(h + block(h))
@@ -275,6 +298,7 @@ class DeeperSCKNetwork(nn.Module):
         ray_m = torch.cross(ray_o, ray_d, dim=-1)
         ray_input = torch.cat([ray_o, ray_d, ray_m], dim=-1)
         ray_feat = F.relu(self.ray_in(self.pos_enc_ray(ray_input)))
+        ray_proj_feat = self.ray_proj(ray_feat)  # Project once per ray (not K*R times)
 
         # 2. Ray-Drop prediction (PLiNK style)
         p_hit = torch.sigmoid(self.ray_drop_head(ray_feat))  # (B, 1)
@@ -286,7 +310,7 @@ class DeeperSCKNetwork(nn.Module):
         outputs = []
         for r in range(self.num_rounds):
             s_knots, c_knots, shift, density = self.forward_single_pass(
-                ray_feat, ray_o, ray_d, s_knots
+                ray_proj_feat, ray_o, ray_d, s_knots
             )
             outputs.append((s_knots, c_knots))
             # Feed refined knot positions into next round of self-conditioning (stop gradient)
@@ -439,6 +463,7 @@ def compute_sck_loss(
     l2_weight: float = 1.0,
     lambda_raydrop: float = 1.0,
     s_max: float = 15.0,
+    return_metrics: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Computes continuous CDF loss with PLiNK-style ray-drop masking and BCE classification.
 
@@ -481,12 +506,12 @@ def compute_sck_loss(
     total_loss = torch.tensor(0.0, device=device, dtype=torch.float32)
     metrics: Dict[str, float] = {}
 
-    # PLiNK target_drop_mask preparation
+    # PLiNK target_drop_mask preparation (kept on GPU to avoid CPU-GPU sync stalls)
     mask = None
-    n_hits = float(B)
+    n_hits: Union[float, torch.Tensor] = float(B)
     if hit_mask is not None:
         mask = hit_mask.view(-1).to(device)
-        n_hits = float(torch.clamp(mask.sum(), min=1.0).item())
+        n_hits = torch.clamp(mask.sum(), min=1.0)
 
     # Mode 1: Exact Closed-Form Grid-Free Analytic Loss
     if hit_range is not None:
@@ -496,21 +521,22 @@ def compute_sck_loss(
                 s_round, c_round, r, s_max=s_max
             )
             if mask is not None:
-                l1_round = (l1_per_ray * mask).sum() / n_hits
                 l2_round = (l2_per_ray * mask).sum() / n_hits
+                l1_round = (l1_per_ray * mask).sum() / n_hits if return_metrics else None
             else:
-                l1_round = l1_per_ray.mean()
                 l2_round = l2_per_ray.mean()
+                l1_round = l1_per_ray.mean() if return_metrics else None
 
             # round_loss = l2_weight * l2_round + l1_weight * l1_round #L1 loss is bad! it will cause us to skip transparent surfaces!
             # Root-CRPS replacement:
             eps = 1e-6
             round_loss = torch.sqrt(l2_round + eps)
-            
+
             total_loss = total_loss + w * round_loss
-            metrics[f"l1_round_{i}"] = l1_round.item()
-            metrics[f"l2_round_{i}"] = l2_round.item()
-            metrics[f"loss_round_{i}"] = round_loss.item()
+            if return_metrics:
+                metrics[f"l1_round_{i}"] = l1_round.item()
+                metrics[f"l2_round_{i}"] = l2_round.item()
+                metrics[f"loss_round_{i}"] = round_loss.item()
 
     # Mode 2: Discrete Grid Fallback Mode
     elif gt_cdf is not None and eval_grid is not None:
@@ -533,9 +559,10 @@ def compute_sck_loss(
 
             round_loss = l2_weight * round_l2 + l1_weight * round_l1
             total_loss = total_loss + w * round_loss
-            metrics[f"l1_round_{i}"] = round_l1.item()
-            metrics[f"l2_round_{i}"] = round_l2.item()
-            metrics[f"loss_round_{i}"] = round_loss.item()
+            if return_metrics:
+                metrics[f"l1_round_{i}"] = round_l1.item()
+                metrics[f"l2_round_{i}"] = round_l2.item()
+                metrics[f"loss_round_{i}"] = round_loss.item()
     else:
         raise ValueError("Either hit_range (recommended) or (gt_cdf, eval_grid) must be provided to compute_sck_loss.")
 
@@ -545,9 +572,11 @@ def compute_sck_loss(
         hit_mask_flat = hit_mask.view(-1).float().to(p_hit.device)
         loss_raydrop = F.binary_cross_entropy(p_hit_flat, hit_mask_flat)
         total_loss = total_loss + lambda_raydrop * loss_raydrop
-        metrics["loss_raydrop"] = loss_raydrop.item()
+        if return_metrics:
+            metrics["loss_raydrop"] = loss_raydrop.item()
 
-    metrics["loss_total"] = total_loss.item()
+    if return_metrics:
+        metrics["loss_total"] = total_loss.item()
     return total_loss, metrics
 
 
@@ -850,7 +879,8 @@ def train_step(
     l2_weight: float = 1.0,
     lambda_raydrop: float = 1.0,
     s_max: float = 15.0,
-) -> float:
+    return_tensor: bool = False,
+) -> Union[float, torch.Tensor]:
     """Executes a single forward and backward optimization step on a training batch.
 
     Supports exact grid-free analytic loss when 'hit_range' is present in batch,
@@ -868,12 +898,13 @@ def train_step(
         l2_weight: Weight for continuous L2 / CRPS loss term (discrete grid fallback mode only).
         lambda_raydrop: Weight for ray-drop classification loss.
         s_max: Maximum scene range.
+        return_tensor: If True, returns detached scalar tensor on GPU to avoid per-step syncs.
 
     Returns:
-        float: Training loss for this batch.
+        float or torch.Tensor: Training loss for this batch.
     """
     model.train()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     if device is None:
         device = next(model.parameters()).device
@@ -922,12 +953,13 @@ def train_step(
         l2_weight=l2_weight,
         lambda_raydrop=lambda_raydrop,
         s_max=s_max,
+        return_metrics=False,
     )
 
     total_loss.backward()
     optimizer.step()
 
-    return total_loss.item()
+    return total_loss.detach() if return_tensor else total_loss.item()
 
 
 def train_epoch(
@@ -961,7 +993,10 @@ def train_epoch(
     Returns:
         float: Average loss across all batches in the epoch.
     """
-    epoch_loss = 0.0
+    if device is None:
+        device = next(model.parameters()).device
+
+    epoch_loss = torch.zeros((), device=device, dtype=torch.float32)
     num_batches = len(dataloader)
 
     for batch in dataloader:
@@ -977,10 +1012,11 @@ def train_epoch(
             l2_weight=l2_weight,
             lambda_raydrop=lambda_raydrop,
             s_max=s_max,
+            return_tensor=True,
         )
         epoch_loss += loss
 
-    return epoch_loss / max(1, num_batches)
+    return (epoch_loss / max(1, num_batches)).item()
 
 
 def train_model(
