@@ -21,6 +21,7 @@ Usage:
 import argparse
 import json
 import logging
+import math
 import struct
 import threading
 import time
@@ -173,6 +174,9 @@ VIEWER_HTML = r"""<!DOCTYPE html>
           <option value="64">64&sup3; (Fast)</option>
           <option value="96" selected>96&sup3; (Balanced)</option>
           <option value="128">128&sup3; (Fine)</option>
+          <option value="256">256&sup3; (KnotFlow)</option>
+          <option value="384">384&sup3; (KnotFlow Ultra)</option>
+          <option value="512">512&sup3; (KnotFlow Max)</option>
         </select>
       </div>
     </div>
@@ -190,7 +194,8 @@ VIEWER_HTML = r"""<!DOCTYPE html>
       <select id="sel-color">
         <option value="range" selected>Range (m)</option>
         <option value="z">Height Z (m)</option>
-        <option value="prob">Return Prob</option>
+        <option value="prob">Return Prob (Total)</option>
+        <option value="local_prob">Local Return Prob</option>
         <option value="normal">Surface Normal</option>
         <option value="clump">Clump ID (MC)</option>
       </select>
@@ -515,7 +520,7 @@ const _idQuat = new THREE.Quaternion();
 const _col = new THREE.Color();
 
 // Client-side state
-let lastPts = null, lastNorms = null, lastRanges = null, lastProbs = null;
+let lastPts = null, lastNorms = null, lastRanges = null, lastProbs = null, lastLocalProbs = null;
 let currentSMax = 15.0;
 let colorMode = 'range';
 let geomMode = 'patches';
@@ -527,7 +532,8 @@ function computePointColors() {
   const colors = new Float32Array(n * 3);
   let vmin = 0.0, vmax = currentSMax, label = 'Range (m)';
   if (colorMode === 'z') { vmin = 0.0; vmax = 3.0; label = 'Height Z (m)'; }
-  else if (colorMode === 'prob') { vmin = 0.0; vmax = 1.0; label = 'Return Prob'; }
+  else if (colorMode === 'prob') { vmin = 0.0; vmax = 1.0; label = 'Return Prob (Total)'; }
+  else if (colorMode === 'local_prob') { vmin = 0.0; vmax = 1.0; label = 'Local Return Prob (±0.25m)'; }
   else if (colorMode === 'normal') { vmin = -1.0; vmax = 1.0; label = 'Normal XYZ -> RGB'; }
 
   document.getElementById('cbar-min').textContent = vmin.toFixed(1);
@@ -547,6 +553,7 @@ function computePointColors() {
   for (let i = 0; i < n; i++) {
     const val = colorMode === 'z' ? lastPts[i * 3 + 2]
               : colorMode === 'prob' ? lastProbs[i]
+              : colorMode === 'local_prob' ? (lastLocalProbs ? lastLocalProbs[i] : lastProbs[i])
               : lastRanges[i];
     const idx = Math.max(0, Math.min(255, Math.round((val - vmin) * inv * 255)));
     colors[i * 3 + 0] = PLASMA_LUT[idx * 3 + 0];
@@ -579,7 +586,7 @@ function rebuildMeshColors() {
       colors[i * 3 + 1] = Math.max(0, Math.min(1, lastMeshNorms[i * 3 + 1] * 0.5 + 0.5));
       colors[i * 3 + 2] = Math.max(0, Math.min(1, lastMeshNorms[i * 3 + 2] * 0.5 + 0.5));
     }
-  } else if (colorMode === 'prob') {
+  } else if (colorMode === 'prob' || colorMode === 'local_prob') {
     // Neutral smooth ceramic clay so Marching Cubes lighting & contours shine
     for (let i = 0; i < n; i++) {
       colors[i * 3 + 0] = 0.78;
@@ -771,15 +778,20 @@ async function loadScene() {
       const name = (obj.name || '').toLowerCase();
       const isFoliage =
         name.includes('foliage') || name.includes('crown') || name.includes('leaf') ||
-        name.includes('leaves') || name.includes('canopy') || name.includes('bush');
+        name.includes('leaves') || name.includes('canopy') || name.includes('bush') ||
+        name.includes('shrub');
       const isWood = name.includes('trunk') || name.includes('branch') || name.includes('log');
+      const isFenceMesh = name.includes('fence_mesh');
+      const isFenceMetal = name.includes('fence_') && !isFenceMesh;
       const isWindow = name.includes('window');
-      const isWall = obj.density >= 50 && !isWood;
+      const isWall = obj.density >= 50 && !isWood && !isFenceMetal;
 
       let color = palette[idx % palette.length];
       let opacity = 0.28;
       if (isFoliage) { color = 0x22c55e; opacity = 0.26; }
       else if (isWood) { color = 0x8b5a2b; opacity = 0.24; }
+      else if (isFenceMesh) { color = 0x94a3b8; opacity = 0.22; }
+      else if (isFenceMetal) { color = 0x64748b; opacity = 0.55; }
       else if (isWindow) { color = 0x38bdf8; opacity = 0.20; }
       else if (isWall) { color = 0x4b5c73; opacity = 0.10; }
 
@@ -853,6 +865,7 @@ async function pollFrame() {
       const norms = new Float32Array(buf, offset + n * 12, n * 3);
       const rngs = new Float32Array(buf, offset + n * 24, n);
       const probs = new Float32Array(buf, offset + n * 28, n);
+      const localProbs = new Float32Array(buf, offset + n * 32, n);
 
       lastVersion = meta.version;
       currentSMax = meta.s_max || currentSMax;
@@ -860,6 +873,7 @@ async function pollFrame() {
       lastNorms = norms;
       lastRanges = rngs;
       lastProbs = probs;
+      lastLocalProbs = localProbs;
 
       rebuildCloudVisual();
 
@@ -1245,7 +1259,8 @@ def render_cloud_fast_gpu(
     threshold: float = 0.5,
     non_return_threshold: float = 0.1,
     batch_size: int = 2048,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    local_prob_delta: float = 0.25,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Fast GPU novel-view point cloud + surface normal render using pre-cached rays.
 
     Unwraps torch.compile (_orig_mod) so odd render batch sizes never trigger
@@ -1262,6 +1277,7 @@ def render_cloud_fast_gpu(
     all_med_ranges = torch.empty((total_rays,), device=render_rays_o.device, dtype=torch.float32)
     all_ranges = torch.empty((total_rays,), device=render_rays_o.device, dtype=torch.float32)
     all_probs = torch.empty((total_rays,), device=render_rays_o.device, dtype=torch.float32)
+    all_local_probs = torch.empty((total_rays,), device=render_rays_o.device, dtype=torch.float32)
     all_valid = torch.empty((total_rays,), device=render_rays_o.device, dtype=torch.bool)
     all_med_valid = torch.empty((total_rays,), device=render_rays_o.device, dtype=torch.bool)
 
@@ -1275,6 +1291,18 @@ def render_cloud_fast_gpu(
         c_1 = torch.gather(c_ext, 1, idx).squeeze(-1)
         alpha = torch.clamp((target.squeeze(-1) - c_0) / torch.clamp(c_1 - c_0, min=1e-5), 0.0, 1.0)
         return s_0 + alpha * (s_1 - s_0)
+
+    def _eval_cdf(s_ext, c_ext, q_ranges, K):
+        q = q_ranges.unsqueeze(-1).contiguous()
+        idx = torch.searchsorted(s_ext.contiguous(), q, right=True)
+        idx = torch.clamp(idx, 1, K)
+        idx_left = idx - 1
+        s_0 = torch.gather(s_ext, 1, idx_left).squeeze(-1)
+        s_1 = torch.gather(s_ext, 1, idx).squeeze(-1)
+        c_0 = torch.gather(c_ext, 1, idx_left).squeeze(-1)
+        c_1 = torch.gather(c_ext, 1, idx).squeeze(-1)
+        alpha = torch.clamp((q_ranges - s_0) / torch.clamp(s_1 - s_0, min=1e-5), 0.0, 1.0)
+        return c_0 + alpha * (c_1 - c_0)
 
     for i in range(0, total_rays, batch_size):
         j = min(i + batch_size, total_rays)
@@ -1304,11 +1332,16 @@ def render_cloud_fast_gpu(
             valid = ray_hit_mask & (u.squeeze(-1) <= c_max)
             pred_ranges = _invert_cdf(s_ext, c_ext, u, K)
 
+        c_hi = _eval_cdf(s_ext, c_ext, pred_ranges + local_prob_delta, K)
+        c_lo = _eval_cdf(s_ext, c_ext, torch.clamp(pred_ranges - local_prob_delta, min=0.0), K)
+        local_probs = torch.clamp(c_hi - c_lo, 0.0, 1.0)
+
         all_pts[i:j] = bo + pred_ranges.unsqueeze(-1) * bd
         all_med_pts[i:j] = bo + med_ranges.unsqueeze(-1) * bd
         all_med_ranges[i:j] = med_ranges
         all_ranges[i:j] = pred_ranges
         all_probs[i:j] = c_max
+        all_local_probs[i:j] = local_probs
         all_valid[i:j] = valid
         all_med_valid[i:j] = med_valid
 
@@ -1319,6 +1352,7 @@ def render_cloud_fast_gpu(
         return (
             np.empty((0, 3), dtype=np.float32),
             np.empty((0, 3), dtype=np.float32),
+            np.empty((0,), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
             np.empty((0,), dtype=np.float32),
         )
@@ -1337,6 +1371,7 @@ def render_cloud_fast_gpu(
         all_normals[all_valid].cpu().numpy().astype(np.float32, copy=False),
         all_ranges[all_valid].cpu().numpy().astype(np.float32, copy=False),
         all_probs[all_valid].cpu().numpy().astype(np.float32, copy=False),
+        all_local_probs[all_valid].cpu().numpy().astype(np.float32, copy=False),
     )
 
 
@@ -1363,8 +1398,12 @@ def compute_scene_bbox(
             half = np.full(3, float(o["radius"]))
         elif kind == "cylinder":
             r = float(o["radius"])
-            h = float(o["height"]) * 0.5
-            half = np.array([r, r, h])
+            hh = float(o["height"]) * 0.5
+            axis = np.asarray(o.get("axis", [0.0, 0.0, 1.0]), dtype=np.float64)
+            axis_norm = np.linalg.norm(axis)
+            axis = axis / axis_norm if axis_norm > 1e-9 else np.array([0.0, 0.0, 1.0])
+            # Exact axis-aligned bounding box half-extents for an arbitrarily oriented cylinder
+            half = hh * np.abs(axis) + r * np.sqrt(np.maximum(0.0, 1.0 - axis * axis))
         else:
             continue
         lo = np.minimum(lo, c - half)
@@ -1378,7 +1417,7 @@ def compute_scene_bbox(
 
 
 def _gaussian_blur_3d(vol_5d: torch.Tensor, sigma: float, radius: int) -> torch.Tensor:
-    """Separable 3D Gaussian blur on GPU for (1, 1, nx, ny, nz) volume."""
+    """Separable 3D Gaussian blur on GPU for (B, 1, nx, ny, nz) volume (same-size output)."""
     coords = torch.arange(-radius, radius + 1, device=vol_5d.device, dtype=vol_5d.dtype)
     k = torch.exp(-0.5 * (coords / sigma) ** 2)
     k = k / k.sum()
@@ -1386,6 +1425,52 @@ def _gaussian_blur_3d(vol_5d: torch.Tensor, sigma: float, radius: int) -> torch.
     x = F.conv3d(x, k.view(1, 1, 1, -1, 1), padding=(0, radius, 0))
     x = F.conv3d(x, k.view(1, 1, 1, 1, -1), padding=(0, 0, radius))
     return x
+
+
+def _gaussian_blur_3d_valid(vol_5d: torch.Tensor, sigma: float, radius: int) -> torch.Tensor:
+    """Separable 3D Gaussian blur with padding=0, stripping a `radius`-voxel halo cleanly.
+
+    Used on halo-padded sparse blocks so boundary values match a global dense blur identically.
+    """
+    coords = torch.arange(-radius, radius + 1, device=vol_5d.device, dtype=vol_5d.dtype)
+    k = torch.exp(-0.5 * (coords / sigma) ** 2)
+    k = k / k.sum()
+    x = F.conv3d(vol_5d, k.view(1, 1, -1, 1, 1), padding=0)
+    x = F.conv3d(x, k.view(1, 1, 1, -1, 1), padding=0)
+    x = F.conv3d(x, k.view(1, 1, 1, 1, -1), padding=0)
+    return x
+
+
+@torch.no_grad()
+def _eval_hash_points_gpu(
+    orig: HashSCKNetwork,
+    pts_flat: torch.Tensor,
+    chunk_size: int = 65536,
+) -> torch.Tensor:
+    """Evaluates HashSCKNetwork's local 3D field scalar in (0, 1) at arbitrary 3D points."""
+    N = pts_flat.shape[0]
+    vals = torch.empty((N,), device=pts_flat.device, dtype=torch.float32)
+    bound = orig.hash_grid.bound
+    for i in range(0, N, chunk_size):
+        j = min(i + chunk_size, N)
+        p = pts_flat[i:j]
+        h = orig.hash_grid(p)
+        parts = [h, p / bound]
+        if orig.use_viewdir:
+            parts.append(torch.zeros_like(p))
+        if not orig.local_cdf:
+            hidden_dim = orig.ray_proj.out_features
+            parts.append(torch.zeros((j - i, hidden_dim), device=pts_flat.device, dtype=torch.float32))
+        feat = orig.cdf_mlp(torch.cat(parts, dim=-1))
+        raw = orig.cdf_out(feat).squeeze(-1)
+        if orig.cdf_mode == "softmax":
+            # In softmax mode, learned logits span ~[-2 (air), +4 (porous), +6 (pillar), +11 (wall)].
+            # Centering & scaling keeps the full physical dynamic range inside (0, 1) instead of
+            # saturating everything above +3 into 0.99+.
+            vals[i:j] = torch.sigmoid((raw - 3.5) / 2.5)
+        else:
+            vals[i:j] = 1.0 - torch.exp(-F.softplus(raw))
+    return vals
 
 
 @torch.no_grad()
@@ -1397,7 +1482,7 @@ def eval_hash_3d_volume_gpu(
     device: Optional[torch.device] = None,
     chunk_size: int = 65536,
 ) -> Optional[Tuple[np.ndarray, np.ndarray, Tuple[float, float, float], Tuple[float, float, float]]]:
-    """Evaluates HashSCKNetwork's continuous 3D field on a voxel grid.
+    """Evaluates HashSCKNetwork's continuous 3D field on a dense uniform voxel grid.
 
     Returns (v_smooth, v_wide, origin, spacing) so Marching Cubes can apply
     real-time Difference-of-Gaussians clump isolation without re-querying the GPU.
@@ -1425,29 +1510,7 @@ def eval_hash_3d_volume_gpu(
     gx, gy, gz = torch.meshgrid(xs, ys, zs, indexing="ij")
     pts = torch.stack([gx, gy, gz], dim=-1).reshape(-1, 3)  # (N, 3)
 
-    N = pts.shape[0]
-    vals = torch.empty((N,), device=device, dtype=torch.float32)
-    bound = orig.hash_grid.bound
-
-    for i in range(0, N, chunk_size):
-        j = min(i + chunk_size, N)
-        p = pts[i:j]
-        h = orig.hash_grid(p)
-        parts = [h, p / bound]
-        if orig.use_viewdir:
-            parts.append(torch.zeros_like(p))
-        if not orig.local_cdf:
-            hidden_dim = orig.ray_proj.out_features
-            parts.append(torch.zeros((j - i, hidden_dim), device=device, dtype=torch.float32))
-        feat = orig.cdf_mlp(torch.cat(parts, dim=-1))
-        raw = orig.cdf_out(feat).squeeze(-1)
-        if orig.cdf_mode == "softmax":
-            # In softmax mode, learned logits span ~[-2 (air), +4 (porous), +6 (pillar), +11 (wall)].
-            # Centering & scaling keeps the full physical dynamic range inside (0, 1) instead of
-            # saturating everything above +3 into 0.99+.
-            vals[i:j] = torch.sigmoid((raw - 3.5) / 2.5)
-        else:
-            vals[i:j] = 1.0 - torch.exp(-F.softplus(raw))
+    vals = _eval_hash_points_gpu(orig, pts, chunk_size=chunk_size)
 
     if was_training:
         orig.train()
@@ -1462,6 +1525,271 @@ def eval_hash_3d_volume_gpu(
     origin = (x0, y0, z0)
     spacing = (sx / max(1, nx - 1), sy / max(1, ny - 1), sz / max(1, nz - 1))
     return v_smooth, v_wide, origin, spacing
+
+
+def build_knotflow_probe_rays(
+    bbox_min: Tuple[float, float, float],
+    bbox_max: Tuple[float, float, float],
+    render_pos: List[float],
+    device: torch.device,
+    num_ring_views: int = 6,
+    num_detectors: int = 24,
+    num_azimuth: int = 120,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pre-builds virtual multi-viewpoint 360-degree probe rays purely from scene bounds.
+
+    Used by Knot-Flow-Guided Coarse-to-Fine Marching Cubes to query the learned model's
+    own self-conditioned knot shift network (zero training-data dependency) and discover
+    thin structures (glass panes, doors, branches) that a coarse uniform grid could miss.
+    """
+    x0, y0, z0 = bbox_min
+    x1, y1, z1 = bbox_max
+    sx, sy, sz = x1 - x0, y1 - y0, z1 - z0
+    cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+    z_lo = z0 + min(0.5, 0.15 * sz)
+    z_hi = z1 - min(0.5, 0.15 * sz)
+    z_base = float(np.clip(render_pos[2], z_lo, z_hi))
+
+    probe_positions: List[List[float]] = [
+        [
+            float(np.clip(render_pos[0], x0 + 0.5, x1 - 0.5)),
+            float(np.clip(render_pos[1], y0 + 0.5, y1 - 0.5)),
+            z_base,
+        ]
+    ]
+    r_probe = 0.22 * min(sx, sy)
+    for k in range(num_ring_views):
+        theta = 2.0 * math.pi * (k / num_ring_views)
+        zk = float(np.clip(z_base + (0.45 if k % 2 == 0 else -0.35), z_lo, z_hi))
+        probe_positions.append([cx + r_probe * math.cos(theta), cy + r_probe * math.sin(theta), zk])
+
+    probe_sensor = LidarProjectionModel(
+        elevation_min=-30.0,
+        elevation_max=25.0,
+        num_detectors=num_detectors,
+        num_azimuth=num_azimuth,
+    )
+    all_o = []
+    all_d = []
+    for pos in probe_positions:
+        ro, rd = probe_sensor.get_rays(sensor_position=pos, flatten=True)
+        all_o.append(ro)
+        all_d.append(rd)
+    ro_cat = np.concatenate(all_o, axis=0).astype(np.float32)
+    rd_cat = np.concatenate(all_d, axis=0).astype(np.float32)
+    return torch.from_numpy(ro_cat).to(device), torch.from_numpy(rd_cat).to(device)
+
+
+@torch.no_grad()
+def eval_hash_3d_blocks_knotflow_gpu(
+    model: torch.nn.Module,
+    bbox_min: Tuple[float, float, float],
+    bbox_max: Tuple[float, float, float],
+    probe_rays_o: torch.Tensor,
+    probe_rays_d: torch.Tensor,
+    grid_res: int = 256,
+    block_size: int = 16,
+    coarse_res: int = 64,
+    dc_thresh: float = 0.04,
+    coarse_thresh: float = 0.28,
+    device: Optional[torch.device] = None,
+    probe_batch_size: int = 4096,
+    block_batch_size: int = 16,
+) -> Optional[Dict[str, Any]]:
+    """Model-only Knot-Flow-Guided Coarse-to-Fine 3D block evaluation for high-res Marching Cubes.
+
+    1. Runs the learned model's self-conditioned knot flow on virtual multi-viewpoint probe
+       rays and marks every fine block where shifted knot intervals predict return mass
+       (dc > dc_thresh), catching thin features without touching training data.
+    2. Runs a fast coarse 3D field pass (coarse_res=64) to catch any large occluded regions
+       and compute the wide low-frequency blur (v_wide_coarse) for clump isolation.
+    3. Evaluates the fine 3D hash+MLP field ONLY inside active blocks (with a 2-voxel blur
+       halo so shared block faces are bit-for-bit identical across adjacent blocks).
+    """
+    orig = getattr(model, "_orig_mod", model)
+    if not isinstance(orig, HashSCKNetwork):
+        return None
+    if device is None:
+        device = next(orig.parameters()).device
+
+    was_training = orig.training
+    orig.eval()
+
+    x0, y0, z0 = bbox_min
+    x1, y1, z1 = bbox_max
+    sx, sy, sz = x1 - x0, y1 - y0, z1 - z0
+    max_xy = max(sx, sy, 1e-3)
+    nx = max(16, int(round(grid_res * (sx / max_xy))))
+    ny = max(16, int(round(grid_res * (sy / max_xy))))
+    nz = max(16, int(round(grid_res * (sz / max_xy))))
+    dx = sx / max(1, nx - 1)
+    dy = sy / max(1, ny - 1)
+    dz = sz / max(1, nz - 1)
+
+    B = int(block_size)
+    nbx = max(1, math.ceil((nx - 1) / B))
+    nby = max(1, math.ceil((ny - 1) / B))
+    nbz = max(1, math.ceil((nz - 1) / B))
+
+    bbox_min_t = torch.tensor([x0, y0, z0], device=device, dtype=torch.float32)
+    inv_blk_span = torch.tensor([1.0 / (B * dx), 1.0 / (B * dy), 1.0 / (B * dz)], device=device, dtype=torch.float32)
+
+    # --- Stage 1: Discover occupied blocks via the model's own self-conditioned knot flow ---
+    active_kf = torch.zeros((nbx, nby, nbz), device=device, dtype=torch.bool)
+    total_probes = probe_rays_o.shape[0]
+    for i in range(0, total_probes, probe_batch_size):
+        j = min(i + probe_batch_size, total_probes)
+        bo = probe_rays_o[i:j]
+        bd = probe_rays_d[i:j]
+        s_knots, c_knots, _, p_hit = orig(bo, bd)
+        dc = c_knots[:, 1:] - c_knots[:, :-1]  # (P, K-1)
+        hit_interval = (p_hit > 0.25) & (dc > dc_thresh)
+        if not hit_interval.any():
+            continue
+        ray_idx, k_idx = torch.nonzero(hit_interval, as_tuple=True)
+        o_sel = bo[ray_idx]
+        d_sel = bd[ray_idx]
+        s_l = s_knots[ray_idx, k_idx]
+        s_r = s_knots[ray_idx, k_idx + 1]
+        s_m = 0.5 * (s_l + s_r)
+        # Mark midpoint + bracketing knot endpoints so surfaces near block faces activate both sides
+        pts_hit = torch.cat(
+            [
+                o_sel + s_m.unsqueeze(-1) * d_sel,
+                o_sel + s_l.unsqueeze(-1) * d_sel,
+                o_sel + s_r.unsqueeze(-1) * d_sel,
+            ],
+            dim=0,
+        )
+        b_ijk = torch.floor((pts_hit - bbox_min_t) * inv_blk_span).long()
+        inb = (
+            (b_ijk[:, 0] >= 0) & (b_ijk[:, 0] < nbx)
+            & (b_ijk[:, 1] >= 0) & (b_ijk[:, 1] < nby)
+            & (b_ijk[:, 2] >= 0) & (b_ijk[:, 2] < nbz)
+        )
+        b_ijk = b_ijk[inb]
+        if b_ijk.numel() > 0:
+            active_kf[b_ijk[:, 0], b_ijk[:, 1], b_ijk[:, 2]] = True
+
+    # --- Stage 2: Fast coarse 3D pass (fallback for occluded pockets + wide blur v_wide) ---
+    cnx = max(16, int(round(coarse_res * (sx / max_xy))))
+    cny = max(16, int(round(coarse_res * (sy / max_xy))))
+    cnz = max(16, int(round(coarse_res * (sz / max_xy))))
+    cxs = torch.linspace(x0, x1, cnx, device=device, dtype=torch.float32)
+    cys = torch.linspace(y0, y1, cny, device=device, dtype=torch.float32)
+    czs = torch.linspace(z0, z1, cnz, device=device, dtype=torch.float32)
+    cgx, cgy, cgz = torch.meshgrid(cxs, cys, czs, indexing="ij")
+    cpts = torch.stack([cgx, cgy, cgz], dim=-1).reshape(-1, 3)
+    cvals = _eval_hash_points_gpu(orig, cpts, chunk_size=65536).view(1, 1, cnx, cny, cnz)
+    v_wide_coarse = _gaussian_blur_3d(cvals, sigma=2.0, radius=4)
+
+    # Dilate coarse occupancy by 1 coarse voxel (~30cm) and map to fine blocks
+    c_dilated = F.max_pool3d(cvals, kernel_size=3, stride=1, padding=1)[0, 0]
+    active_coarse = torch.zeros((nbx, nby, nbz), device=device, dtype=torch.bool)
+    c_occ_idx = torch.nonzero(c_dilated > coarse_thresh, as_tuple=False)
+    if c_occ_idx.numel() > 0:
+        cx_pts = torch.stack([cxs[c_occ_idx[:, 0]], cys[c_occ_idx[:, 1]], czs[c_occ_idx[:, 2]]], dim=-1)
+        cb_ijk = torch.floor((cx_pts - bbox_min_t) * inv_blk_span).long()
+        cb_ijk[:, 0].clamp_(0, nbx - 1)
+        cb_ijk[:, 1].clamp_(0, nby - 1)
+        cb_ijk[:, 2].clamp_(0, nbz - 1)
+        active_coarse[cb_ijk[:, 0], cb_ijk[:, 1], cb_ijk[:, 2]] = True
+
+    active_blocks = active_kf | active_coarse
+    n_kf_only = int((active_kf & ~active_coarse).sum().item())
+    active_coords = torch.nonzero(active_blocks, as_tuple=False).cpu().tolist()
+
+    # --- Stage 3: Evaluate fine 3D field ONLY inside active blocks (with exact 2-voxel halo) ---
+    halo = 2
+    pad_len = B + 1 + 2 * halo  # 21 for B=16, halo=2
+    local_pad = torch.arange(-halo, B + 1 + halo, device=device, dtype=torch.long)  # (21,)
+    local_core = torch.arange(0, B + 1, device=device, dtype=torch.long)  # (17,)
+    inv_span_x = 2.0 / max(sx, 1e-6)
+    inv_span_y = 2.0 / max(sy, 1e-6)
+    inv_span_z = 2.0 / max(sz, 1e-6)
+
+    blocks_out: List[Tuple[int, int, int, int, int, int, np.ndarray, np.ndarray]] = []
+    num_active = len(active_coords)
+
+    for b_start in range(0, num_active, block_batch_size):
+        batch_coords = active_coords[b_start : b_start + block_batch_size]
+        mb = len(batch_coords)
+
+        pts_list = []
+        grid_norm_list = []
+        dims_list = []
+        for bx, by, bz in batch_coords:
+            ix0, iy0, iz0 = bx * B, by * B, bz * B
+            wx = min(B + 1, nx - ix0)
+            wy = min(B + 1, ny - iy0)
+            wz = min(B + 1, nz - iz0)
+            dims_list.append((bx, by, bz, wx, wy, wz))
+
+            ix_p = (ix0 + local_pad).clamp(0, nx - 1)
+            iy_p = (iy0 + local_pad).clamp(0, ny - 1)
+            iz_p = (iz0 + local_pad).clamp(0, nz - 1)
+            px = x0 + ix_p.float() * dx
+            py = y0 + iy_p.float() * dy
+            pz = z0 + iz_p.float() * dz
+            gx, gy, gz = torch.meshgrid(px, py, pz, indexing="ij")
+            pts_list.append(torch.stack([gx, gy, gz], dim=-1))
+
+            ix_c = (ix0 + local_core).clamp(0, nx - 1)
+            iy_c = (iy0 + local_core).clamp(0, ny - 1)
+            iz_c = (iz0 + local_core).clamp(0, nz - 1)
+            cx_n = (ix_c.float() * dx) * inv_span_x - 1.0
+            cy_n = (iy_c.float() * dy) * inv_span_y - 1.0
+            cz_n = (iz_c.float() * dz) * inv_span_z - 1.0
+            gnx, gny, gnz = torch.meshgrid(cx_n, cy_n, cz_n, indexing="ij")
+            # F.grid_sample expects (z, y, x) order for (D, H, W) = (cnx, cny, cnz)
+            grid_norm_list.append(torch.stack([gnz, gny, gnx], dim=-1))
+
+        pts_batch = torch.stack(pts_list, dim=0).reshape(-1, 3)  # (mb * 21^3, 3)
+        vals_batch = _eval_hash_points_gpu(orig, pts_batch, chunk_size=65536).view(
+            mb, 1, pad_len, pad_len, pad_len
+        )
+        # Valid-padded blur strips the 2-voxel halo -> exact (mb, 1, 17, 17, 17)
+        smooth_batch = _gaussian_blur_3d_valid(vals_batch, sigma=0.85, radius=halo)[:, 0]
+
+        # Trilinearly sample wide background blur for all blocks in the mini-batch
+        grid_norm_batch = torch.stack(grid_norm_list, dim=0)  # (mb, 17, 17, 17, 3)
+        wide_batch = F.grid_sample(
+            v_wide_coarse.expand(mb, -1, -1, -1, -1),
+            grid_norm_batch,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )[:, 0]
+
+        smooth_np = smooth_batch.cpu().numpy().astype(np.float32)
+        wide_np = wide_batch.cpu().numpy().astype(np.float32)
+        for bi, (bx, by, bz, wx, wy, wz) in enumerate(dims_list):
+            blocks_out.append(
+                (
+                    bx,
+                    by,
+                    bz,
+                    wx,
+                    wy,
+                    wz,
+                    np.ascontiguousarray(smooth_np[bi, :wx, :wy, :wz]),
+                    np.ascontiguousarray(wide_np[bi, :wx, :wy, :wz]),
+                )
+            )
+
+    if was_training:
+        orig.train()
+
+    return {
+        "blocks": blocks_out,
+        "dims": (nx, ny, nz),
+        "origin": (x0, y0, z0),
+        "spacing": (dx, dy, dz),
+        "block_size": B,
+        "n_active_blocks": num_active,
+        "n_total_blocks": nbx * nby * nbz,
+        "n_kf_only_blocks": n_kf_only,
+    }
 
 
 def run_marching_cubes_vtk(
@@ -1535,6 +1863,172 @@ def run_marching_cubes_vtk(
     indices = numpy_support.vtk_to_numpy(poly.GetPolys().GetConnectivityArray()).astype(np.uint32, copy=True)
 
     # Prune tiny isolated floater specks (< min_clump_verts)
+    if min_clump_verts > 0 and len(regions) > 0:
+        counts = np.bincount(regions)
+        keep_vert = counts[regions] >= min_clump_verts
+        if not np.all(keep_vert):
+            if not np.any(keep_vert):
+                return (
+                    np.empty((0, 3), dtype=np.float32),
+                    np.empty((0, 3), dtype=np.float32),
+                    np.empty((0,), dtype=np.uint32),
+                    np.empty((0,), dtype=np.uint32),
+                )
+            tris = indices.reshape(-1, 3)
+            keep_tri = keep_vert[tris[:, 0]] & keep_vert[tris[:, 1]] & keep_vert[tris[:, 2]]
+            tris = tris[keep_tri]
+            remap = np.full(len(verts), -1, dtype=np.int64)
+            kept_idx = np.nonzero(keep_vert)[0]
+            remap[kept_idx] = np.arange(len(kept_idx), dtype=np.int64)
+            verts = np.ascontiguousarray(verts[kept_idx])
+            norms = np.ascontiguousarray(norms[kept_idx])
+            regions = np.ascontiguousarray(regions[kept_idx])
+            indices = np.ascontiguousarray(remap[tris].reshape(-1).astype(np.uint32))
+
+    return verts, norms, regions, indices
+
+
+def run_marching_cubes_blocks_vtk(
+    blocks: List[Tuple[int, int, int, int, int, int, np.ndarray, np.ndarray]],
+    dims: Tuple[int, int, int],
+    origin: Tuple[float, float, float],
+    spacing: Tuple[float, float, float],
+    block_size: int,
+    iso_level: float = 0.45,
+    clump_isolate: float = 0.45,
+    obs_masks: Optional[List[np.ndarray]] = None,
+    min_clump_verts: int = 60,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extracts a seamless triangle mesh from sparse 3D blocks via VTK Flying Edges.
+
+    Runs Flying Edges only on active blocks whose effective scalar field straddles
+    `iso_level`, welds shared block-face vertices via vtkCleanPolyData, recomputes
+    seamless smooth normals, and applies the same connected-component clump pruning.
+    """
+    import vtk
+    from vtkmodules.util import numpy_support
+
+    if not blocks:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0,), dtype=np.uint32),
+            np.empty((0,), dtype=np.uint32),
+        )
+
+    nx, ny, nz = dims
+    x0, y0, z0 = origin
+    dx, dy, dz = spacing
+    B = int(block_size)
+
+    append = vtk.vtkAppendPolyData()
+    added = 0
+
+    for idx, (bx, by, bz, wx, wy, wz, v_smooth, v_wide) in enumerate(blocks):
+        if wx < 2 or wy < 2 or wz < 2:
+            continue
+        vol_eff = np.clip(v_smooth - (clump_isolate * 0.75) * v_wide, 0.0, 1.0).astype(
+            np.float32, copy=False
+        )
+        if obs_masks is not None:
+            vol_eff = vol_eff * obs_masks[idx]
+
+        # Zero ONLY global outer bbox faces so Marching Cubes closes cleanly at room/scene walls
+        ix0, iy0, iz0 = bx * B, by * B, bz * B
+        if ix0 == 0:
+            vol_eff[0, :, :] = 0.0
+        if ix0 + wx == nx:
+            vol_eff[-1, :, :] = 0.0
+        if iy0 == 0:
+            vol_eff[:, 0, :] = 0.0
+        if iy0 + wy == ny:
+            vol_eff[:, -1, :] = 0.0
+        if iz0 == 0:
+            vol_eff[:, :, 0] = 0.0
+        if iz0 + wz == nz:
+            vol_eff[:, :, -1] = 0.0
+
+        # Fast early-out if this block does not cross the isosurface
+        if float(vol_eff.max()) < iso_level or float(vol_eff.min()) > iso_level:
+            continue
+
+        img = vtk.vtkImageData()
+        img.SetDimensions(wx, wy, wz)
+        img.SetOrigin(x0 + ix0 * dx, y0 + iy0 * dy, z0 + iz0 * dz)
+        img.SetSpacing(dx, dy, dz)
+        flat_f = np.ascontiguousarray(vol_eff.ravel(order="F"), dtype=np.float32)
+        vtk_arr = numpy_support.numpy_to_vtk(flat_f, deep=True, array_type=vtk.VTK_FLOAT)
+        img.GetPointData().SetScalars(vtk_arr)
+
+        fe = vtk.vtkFlyingEdges3D()
+        fe.SetInputData(img)
+        fe.SetValue(0, float(iso_level))
+        fe.ComputeNormalsOff()
+        fe.Update()
+
+        out_poly = fe.GetOutput()
+        if out_poly.GetNumberOfCells() > 0:
+            append.AddInputData(out_poly)
+            added += 1
+
+    if added == 0:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0,), dtype=np.uint32),
+            np.empty((0,), dtype=np.uint32),
+        )
+
+    append.Update()
+
+    # Weld duplicate vertices along shared block faces so clumps & normals are seamless
+    clean = vtk.vtkCleanPolyData()
+    clean.SetInputConnection(append.GetOutputPort())
+    clean.SetToleranceIsAbsolute(True)
+    clean.SetAbsoluteTolerance(0.25 * min(dx, dy, dz))
+    clean.Update()
+
+    normals = vtk.vtkPolyDataNormals()
+    normals.SetInputConnection(clean.GetOutputPort())
+    normals.ComputePointNormalsOn()
+    normals.ComputeCellNormalsOff()
+    normals.SplittingOff()
+    normals.ConsistencyOff()
+    normals.AutoOrientNormalsOff()
+    normals.Update()
+
+    conn = vtk.vtkPolyDataConnectivityFilter()
+    conn.SetInputConnection(normals.GetOutputPort())
+    conn.SetExtractionModeToAllRegions()
+    conn.ColorRegionsOn()
+    conn.Update()
+
+    poly = conn.GetOutput()
+    n_pts = poly.GetNumberOfPoints()
+    n_tris = poly.GetNumberOfCells()
+    if n_pts == 0 or n_tris == 0:
+        return (
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0, 3), dtype=np.float32),
+            np.empty((0,), dtype=np.uint32),
+            np.empty((0,), dtype=np.uint32),
+        )
+
+    verts = numpy_support.vtk_to_numpy(poly.GetPoints().GetData()).astype(np.float32, copy=True)
+    norms_vtk = poly.GetPointData().GetNormals()
+    norms = (
+        numpy_support.vtk_to_numpy(norms_vtk).astype(np.float32, copy=True)
+        if norms_vtk is not None
+        else np.zeros_like(verts)
+    )
+    regions_vtk = poly.GetPointData().GetArray("RegionId")
+    regions = (
+        numpy_support.vtk_to_numpy(regions_vtk).astype(np.uint32, copy=True)
+        if regions_vtk is not None
+        else np.zeros((n_pts,), dtype=np.uint32)
+    )
+    indices = numpy_support.vtk_to_numpy(poly.GetPolys().GetConnectivityArray()).astype(np.uint32, copy=True)
+
     if min_clump_verts > 0 and len(regions) > 0:
         counts = np.bincount(regions)
         keep_vert = counts[regions] >= min_clump_verts
@@ -1655,6 +2149,61 @@ class OnlineVisibilityGrid:
         return (obs_5d[0, 0] > 0.15).float().cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
+    def sample_observed_blocks(
+        self,
+        blocks: List[Tuple[int, int, int, int, int, int, np.ndarray, np.ndarray]],
+        dims: Tuple[int, int, int],
+        spacing: Tuple[float, float, float],
+        block_size: int,
+    ) -> List[np.ndarray]:
+        """Samples the smoothed observed mask ONLY on sparse active blocks via GPU grid_sample."""
+        if not blocks:
+            return []
+        obs_5d = _gaussian_blur_3d(
+            self.grid.view(1, 1, self.nx, self.ny, self.nz).float(), sigma=0.7, radius=1
+        )
+        nx, ny, nz = dims
+        dx, dy, dz = spacing
+        sx = max(dx * max(1, nx - 1), 1e-6)
+        sy = max(dy * max(1, ny - 1), 1e-6)
+        sz = max(dz * max(1, nz - 1), 1e-6)
+        inv_sx, inv_sy, inv_sz = 2.0 / sx, 2.0 / sy, 2.0 / sz
+        B = int(block_size)
+        local_core = torch.arange(0, B + 1, device=self.device, dtype=torch.long)
+
+        masks_out: List[np.ndarray] = []
+        batch_sz = 16
+        for start in range(0, len(blocks), batch_sz):
+            chunk = blocks[start : start + batch_sz]
+            mb = len(chunk)
+            grids = []
+            shapes = []
+            for bx, by, bz, wx, wy, wz, _, _ in chunk:
+                shapes.append((wx, wy, wz))
+                ix_c = (bx * B + local_core).clamp(0, nx - 1)
+                iy_c = (by * B + local_core).clamp(0, ny - 1)
+                iz_c = (bz * B + local_core).clamp(0, nz - 1)
+                cx_n = (ix_c.float() * dx) * inv_sx - 1.0
+                cy_n = (iy_c.float() * dy) * inv_sy - 1.0
+                cz_n = (iz_c.float() * dz) * inv_sz - 1.0
+                gnx, gny, gnz = torch.meshgrid(cx_n, cy_n, cz_n, indexing="ij")
+                grids.append(torch.stack([gnz, gny, gnx], dim=-1))
+            grid_b = torch.stack(grids, dim=0)
+            sampled = (
+                F.grid_sample(
+                    obs_5d.expand(mb, -1, -1, -1, -1),
+                    grid_b,
+                    mode="bilinear",
+                    padding_mode="border",
+                    align_corners=True,
+                )[:, 0]
+                > 0.15
+            ).float().cpu().numpy().astype(np.float32)
+            for bi, (wx, wy, wz) in enumerate(shapes):
+                masks_out.append(np.ascontiguousarray(sampled[bi, :wx, :wy, :wz]))
+        return masks_out
+
+    @torch.no_grad()
     def extract_unobserved_mesh_vtk(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         """Extracts a smooth 3D Marching Cubes mesh enclosing all UNOBSERVED voxels."""
         obs_5d = self.grid.view(1, 1, self.nx, self.ny, self.nz).float()
@@ -1735,6 +2284,7 @@ class LiveServerState:
         self._last_norms = np.empty((0, 3), dtype=np.float32)
         self._last_rngs = np.empty((0,), dtype=np.float32)
         self._last_probs = np.empty((0,), dtype=np.float32)
+        self._last_local_probs = np.empty((0,), dtype=np.float32)
 
     def _pack_blob(
         self,
@@ -1743,11 +2293,19 @@ class LiveServerState:
         norms: np.ndarray,
         rngs: np.ndarray,
         probs: np.ndarray,
+        local_probs: np.ndarray,
     ) -> bytes:
         meta_bytes = json.dumps(meta).encode("utf-8")
         pad = (-len(meta_bytes)) % 4
         header = struct.pack("<I", len(meta_bytes)) + meta_bytes + (b"\x00" * pad)
-        return header + pts.tobytes() + norms.tobytes() + rngs.tobytes() + probs.tobytes()
+        return (
+            header
+            + pts.tobytes()
+            + norms.tobytes()
+            + rngs.tobytes()
+            + probs.tobytes()
+            + local_probs.tobytes()
+        )
 
     def publish(
         self,
@@ -1755,6 +2313,7 @@ class LiveServerState:
         norms: np.ndarray,
         rngs: np.ndarray,
         probs: np.ndarray,
+        local_probs: np.ndarray,
         epoch_float: float,
         total_epochs: int,
         step: int,
@@ -1790,8 +2349,9 @@ class LiveServerState:
             self._last_norms = norms
             self._last_rngs = rngs
             self._last_probs = probs
+            self._last_local_probs = local_probs
             self.latest_meta = meta
-            self.latest_blob = self._pack_blob(meta, pts, norms, rngs, probs)
+            self.latest_blob = self._pack_blob(meta, pts, norms, rngs, probs, local_probs)
 
     def bump_meta_only(self) -> None:
         """Repacks latest cloud with updated pause/method flags so UI reflects clicks instantly."""
@@ -1805,7 +2365,12 @@ class LiveServerState:
             meta["render_method"] = self.render_method
             self.latest_meta = meta
             self.latest_blob = self._pack_blob(
-                meta, self._last_pts, self._last_norms, self._last_rngs, self._last_probs
+                meta,
+                self._last_pts,
+                self._last_norms,
+                self._last_rngs,
+                self._last_probs,
+                self._last_local_probs,
             )
 
     def get_frame_if_newer(self, client_version: int) -> Optional[bytes]:
@@ -2005,7 +2570,7 @@ def start_http_server(state: LiveServerState, host: str, port: int) -> Threading
                     if "mask_unobserved" in payload:
                         state.mask_unobserved = bool(payload["mask_unobserved"])
                     if "grid_res" in payload:
-                        state.mesh_res = max(32, min(160, int(payload["grid_res"])))
+                        state.mesh_res = max(32, min(512, int(payload["grid_res"])))
                 state.mesh_dirty_event.set()
                 state.rerender_event.set()
             elif cmd == "set_unobs":
@@ -2093,7 +2658,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-method", type=str, choices=["sample", "threshold"], default="sample", help="CDF point extraction mode (default: sample)")
     parser.add_argument("--threshold", type=float, default=0.5, help="CDF threshold when --render-method=threshold (default: 0.5)")
     parser.add_argument("--non-return-threshold", type=float, default=0.1, help="Prune ray if P(non-return) > threshold (default: 0.1)")
-    parser.add_argument("--color-by", type=str, choices=["range", "z", "probability", "normal", "clump"], default="range", help="Initial point color scalar (default: range)")
+    parser.add_argument("--color-by", type=str, choices=["range", "z", "probability", "local_prob", "normal", "clump"], default="range", help="Initial point color scalar (default: range)")
     parser.add_argument("--point-style", type=str, choices=["points", "spheres", "patches", "mesh", "mesh+patches"], default="patches", help="Initial visual style (default: patches)")
     parser.add_argument("--mesh-iso", type=float, default=0.45, help="Initial Marching Cubes iso-level in (0, 1) (default: 0.45)")
     parser.add_argument("--clump-isolate", type=float, default=0.45, help="Difference-of-Gaussians clump isolation strength in [0, 1] (default: 0.45)")
@@ -2205,8 +2770,14 @@ def main() -> None:
         flush=True,
     )
 
-    # 4. Start Three.js HTTP server + online GPU 3D visibility tracker
+    # 4. Start Three.js HTTP server + online GPU 3D visibility tracker + knot-flow probe rays
     mesh_bbox_min, mesh_bbox_max = compute_scene_bbox(scene_cfg, args.s_max)
+    kf_probe_rays_o, kf_probe_rays_d = build_knotflow_probe_rays(
+        bbox_min=mesh_bbox_min,
+        bbox_max=mesh_bbox_max,
+        render_pos=args.render_pos,
+        device=device,
+    )
     vis_grid = OnlineVisibilityGrid(
         bbox_min=mesh_bbox_min,
         bbox_max=mesh_bbox_max,
@@ -2217,8 +2788,10 @@ def main() -> None:
         device=device,
     )
     cached_vol_info: Dict[str, Any] = {
+        "mode": None,
         "v_smooth": None,
         "v_wide": None,
+        "sparse": None,
         "origin": None,
         "spacing": None,
         "step": -1,
@@ -2274,54 +2847,113 @@ def main() -> None:
         if not enabled:
             return
         t_m0 = time.perf_counter()
+        use_sparse = res > 128
+        target_mode = "sparse" if use_sparse else "dense"
+        has_cache = (
+            cached_vol_info["sparse"] is not None
+            if use_sparse
+            else cached_vol_info["v_smooth"] is not None
+        )
         need_vol = (
             force_eval
-            or cached_vol_info["v_smooth"] is None
+            or not has_cache
+            or cached_vol_info["mode"] != target_mode
             or cached_vol_info["step"] != step
             or cached_vol_info["res"] != res
         )
-        if need_vol:
-            vol_out = eval_hash_3d_volume_gpu(
-                model=model,
-                bbox_min=mesh_bbox_min,
-                bbox_max=mesh_bbox_max,
-                grid_res=res,
-                device=device,
+
+        if use_sparse:
+            if need_vol:
+                sparse_out = eval_hash_3d_blocks_knotflow_gpu(
+                    model=model,
+                    bbox_min=mesh_bbox_min,
+                    bbox_max=mesh_bbox_max,
+                    probe_rays_o=kf_probe_rays_o,
+                    probe_rays_d=kf_probe_rays_d,
+                    grid_res=res,
+                    device=device,
+                )
+                if sparse_out is None:
+                    return
+                cached_vol_info["mode"] = "sparse"
+                cached_vol_info["sparse"] = sparse_out
+                cached_vol_info["v_smooth"] = None
+                cached_vol_info["v_wide"] = None
+                cached_vol_info["origin"] = sparse_out["origin"]
+                cached_vol_info["spacing"] = sparse_out["spacing"]
+                cached_vol_info["step"] = step
+                cached_vol_info["res"] = res
+                pct = 100.0 * sparse_out["n_active_blocks"] / max(1, sparse_out["n_total_blocks"])
+                print(
+                    f"  [KnotFlow MC {res}³] Active blocks: "
+                    f"{sparse_out['n_active_blocks']}/{sparse_out['n_total_blocks']} ({pct:.1f}%, "
+                    f"+{sparse_out['n_kf_only_blocks']} knot-flow-only)",
+                    flush=True,
+                )
+
+            sp = cached_vol_info["sparse"]
+            obs_masks = (
+                vis_grid.sample_observed_blocks(
+                    sp["blocks"], sp["dims"], sp["spacing"], sp["block_size"]
+                )
+                if (mask_unobs and step > 0)
+                else None
             )
-            if vol_out is None:
-                return
-            v_smooth, v_wide, origin, spacing = vol_out
-            cached_vol_info["v_smooth"] = v_smooth
-            cached_vol_info["v_wide"] = v_wide
-            cached_vol_info["origin"] = origin
-            cached_vol_info["spacing"] = spacing
-            cached_vol_info["step"] = step
-            cached_vol_info["res"] = res
+            verts, norms, regions, indices = run_marching_cubes_blocks_vtk(
+                blocks=sp["blocks"],
+                dims=sp["dims"],
+                origin=sp["origin"],
+                spacing=sp["spacing"],
+                block_size=sp["block_size"],
+                iso_level=iso,
+                clump_isolate=clump,
+                obs_masks=obs_masks,
+            )
+        else:
+            if need_vol:
+                vol_out = eval_hash_3d_volume_gpu(
+                    model=model,
+                    bbox_min=mesh_bbox_min,
+                    bbox_max=mesh_bbox_max,
+                    grid_res=res,
+                    device=device,
+                )
+                if vol_out is None:
+                    return
+                v_smooth, v_wide, origin, spacing = vol_out
+                cached_vol_info["mode"] = "dense"
+                cached_vol_info["sparse"] = None
+                cached_vol_info["v_smooth"] = v_smooth
+                cached_vol_info["v_wide"] = v_wide
+                cached_vol_info["origin"] = origin
+                cached_vol_info["spacing"] = spacing
+                cached_vol_info["step"] = step
+                cached_vol_info["res"] = res
 
-        # Difference-of-Gaussians local peak sharpening: suppresses broad low-density
-        # shadow bridges / blind-cone humps so foreground objects isolate cleanly from walls
-        vol_eff = np.clip(
-            cached_vol_info["v_smooth"] - (clump * 0.75) * cached_vol_info["v_wide"],
-            0.0,
-            1.0,
-        ).astype(np.float32, copy=False)
-        if mask_unobs and step > 0:
-            obs_mask = vis_grid.get_observed_mask_numpy(vol_eff.shape)
-            vol_eff = vol_eff * obs_mask
-        # Zero outer 1-voxel shell so Marching Cubes closes cleanly at bbox walls
-        vol_eff[0, :, :] = 0.0
-        vol_eff[-1, :, :] = 0.0
-        vol_eff[:, 0, :] = 0.0
-        vol_eff[:, -1, :] = 0.0
-        vol_eff[:, :, 0] = 0.0
-        vol_eff[:, :, -1] = 0.0
+            # Difference-of-Gaussians local peak sharpening: suppresses broad low-density
+            # shadow bridges / blind-cone humps so foreground objects isolate cleanly from walls
+            vol_eff = np.clip(
+                cached_vol_info["v_smooth"] - (clump * 0.75) * cached_vol_info["v_wide"],
+                0.0,
+                1.0,
+            ).astype(np.float32, copy=False)
+            if mask_unobs and step > 0:
+                obs_mask = vis_grid.get_observed_mask_numpy(vol_eff.shape)
+                vol_eff = vol_eff * obs_mask
+            # Zero outer 1-voxel shell so Marching Cubes closes cleanly at bbox walls
+            vol_eff[0, :, :] = 0.0
+            vol_eff[-1, :, :] = 0.0
+            vol_eff[:, 0, :] = 0.0
+            vol_eff[:, -1, :] = 0.0
+            vol_eff[:, :, 0] = 0.0
+            vol_eff[:, :, -1] = 0.0
 
-        verts, norms, regions, indices = run_marching_cubes_vtk(
-            vol_eff,
-            cached_vol_info["origin"],
-            cached_vol_info["spacing"],
-            iso_level=iso,
-        )
+            verts, norms, regions, indices = run_marching_cubes_vtk(
+                vol_eff,
+                cached_vol_info["origin"],
+                cached_vol_info["spacing"],
+                iso_level=iso,
+            )
         mesh_ms = (time.perf_counter() - t_m0) * 1000.0
         state.publish_mesh(
             verts=verts,
@@ -2364,7 +2996,7 @@ def main() -> None:
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t_r0 = time.perf_counter()
-            pts, norms, rngs, probs = render_cloud_fast_gpu(
+            pts, norms, rngs, probs, local_probs = render_cloud_fast_gpu(
                 model=model,
                 render_rays_o=render_rays_o,
                 render_rays_d=render_rays_d,
@@ -2380,6 +3012,7 @@ def main() -> None:
                 norms=norms,
                 rngs=rngs,
                 probs=probs,
+                local_probs=local_probs,
                 epoch_float=epoch_float,
                 total_epochs=args.epochs,
                 step=step,
@@ -2403,8 +3036,10 @@ def main() -> None:
             with state.lock:
                 state.loss_history.clear()
             vis_grid.reset()
+            cached_vol_info["mode"] = None
             cached_vol_info["v_smooth"] = None
             cached_vol_info["v_wide"] = None
+            cached_vol_info["sparse"] = None
             cached_vol_info["step"] = -1
             push_render(0.0, 0, float("nan"), 0.0, "Untrained", append_loss=False)
 

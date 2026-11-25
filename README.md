@@ -3,6 +3,10 @@ Exploring LiDAR-Based Neural Hazard Fields
 
 ## TODO:
 
+* incorporate density into total hashmap visualiztion
+
+* implement **knot-flow-guided coarse-to-fine Marching Cubes** in `train_live.py` (use the learned knot shift network on virtual multi-viewpoint probe rays to discover thin occupied blocks without leaking training data, enabling $O(R^2)$ high-res `256–512+` meshing)
+
 * make online 3D visualization for trainig (alternative to jupyter notebook)
 
 * try instant-ngp hash encoding
@@ -178,6 +182,13 @@ Because `HashSCKNetwork` (`local_cdf=True`) decouples **Stage A ("where to look"
 3. **Practical Notes for Downstream Robotics Deployment:**
    - **Calibrated Physical Units:** Use `--cdf-mode hazard` when querying $\lambda(\mathbf{x})$ directly as physical extinction ($\text{m}^{-1}$, so $1 - e^{-\lambda(\mathbf{x})\Delta s}$ is calibrated return/collision probability); in `softmax` mode, raw logits are unnormalized log-ratios relative to the escape bin and require rescaling for visualization/thresholding.
    - **Observed Free vs. Unobserved Space:** Neural hash grids have an unsupervised prior in blind cones and occlusion shadows; pairing the hash grid with a lightweight 3D visitation/ray-count bitmask separates *known-free* (safe) from *unobserved* (explore cautiously).
+4. **Knot-Flow-Guided Coarse-to-Fine Surface Extraction (Model-Only $O(R^2)$ Meshing):**
+   - **The Density-Field Coarse-to-Fine Problem:** Dense uniform Marching Cubes scales as $O(R^3)$ (intractable at cm-level resolution over 20m+ scenes). Unlike an SDF ($|\nabla f|\le 1$), a density/hazard field gives no distance bound in empty air—so a standard coarse grid (`R=64–96`) can step cleanly over thin structures (`6 cm` window panes, open doors, `12 cm` tree branches) and prune them. Meanwhile, seeding active blocks from training LiDAR points is self-referential (leaking data rather than visualizing the learned representation), and Instant-NGP's keyless colliding hash table cannot directly report which 3D regions are empty.
+   - **The SCK-Native Solution (100% Learned-Model-Driven):** Because `HashSCKNetwork` explicitly learns a **self-conditioned knot flow** ("where surfaces live") coupled with a local 3D hazard field ("what is there"), we can use the model's own knot flow to discover occupied blocks before fine meshing:
+     1. Cast a lightweight batch of virtual probe rays (~15–30k rays, ~20–50 ms on GPU in `no_grad`) from multiple realistic interior/orbit viewpoints (or bidirectional sweeps) so both sides of walls/trunks are observed and Plücker features $(\mathbf{d}, \mathbf{m})$ remain in-distribution.
+     2. Mark coarse blocks active wherever shifted knot intervals carry significant predicted CDF mass ($\Delta C_k = C_k - C_{k-1} > \tau$ at $\mathbf{x}_{\text{mid}} = \mathbf{o} + s_{\text{mid}}\mathbf{d}$), unioned with a cheap coarse 3D field pass (`R=64`, ~15 ms) + 1-block dilation.
+     3. Evaluate the fine-resolution 3D field (`R=256–512+`) and run Marching Cubes **only** on the ~1–5% active blocks, reducing meshing time & memory from $O(R^3)$ to $O(R^2)$ without touching training data.
+   - **Implementation Details:** Upsample the wide Difference-of-Gaussians blur (`v_wide`) from the coarse grid to avoid large per-block halo padding, and weld shared block-boundary vertices (`vtkCleanPolyData`) before connected-component clump filtering (`vtkPolyDataConnectivityFilter`).
 
 ### Synthetic Data Pipeline (`synthetic_data_generation_utils.py`)
 

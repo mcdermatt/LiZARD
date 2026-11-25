@@ -295,14 +295,97 @@ def add_tree(
     )
 
 
+def add_chain_link_fence(
+    scene: Scene,
+    waypoints_xy: List[Tuple[float, float]],
+    height: float = 2.30,
+    mesh_thickness: float = 0.04,
+    mesh_density: float = 14.0,
+    post_spacing: float = 2.1,
+    post_radius: float = 0.045,
+    rail_radius: float = 0.025,
+    name_prefix: str = "chain_link_fence",
+) -> None:
+    """Adds a multi-segment chain-link fence with solid metal posts/rails and
+    partially transparent wire-mesh panels.
+
+    With mesh_density=14.0 across mesh_thickness=0.04m, normal-incidence LiDAR rays
+    return off the wire mesh ~43% of the time (1 - exp(-14.0 * 0.04)) and transmit
+    ~57% of the time to hit trees, shrubs, and terrain behind the fence.
+    """
+    if len(waypoints_xy) < 2:
+        return
+
+    post_coords: List[Tuple[float, float]] = []
+    for seg_i in range(len(waypoints_xy) - 1):
+        p0 = np.array(waypoints_xy[seg_i], dtype=np.float64)
+        p1 = np.array(waypoints_xy[seg_i + 1], dtype=np.float64)
+        delta = p1 - p0
+        seg_len = float(np.linalg.norm(delta))
+        if seg_len < 1e-4:
+            continue
+        seg_dir = delta / seg_len
+        yaw_deg = float(np.rad2deg(np.arctan2(seg_dir[1], seg_dir[0])))
+        mid_xy = 0.5 * (p0 + p1)
+
+        # Partially transparent chain-link wire mesh panel (local X = along fence, Y = thickness)
+        scene.add_box(
+            center=[float(mid_xy[0]), float(mid_xy[1]), 0.5 * height],
+            size=[seg_len, mesh_thickness, height - 0.06],
+            rotation=[0.0, 0.0, yaw_deg],
+            density=mesh_density,
+            name=f"{name_prefix}_mesh_seg{seg_i + 1}",
+        )
+
+        # Solid horizontal top rail & lower tension rail
+        rail_axis = [float(seg_dir[0]), float(seg_dir[1]), 0.0]
+        scene.add_cylinder(
+            center=[float(mid_xy[0]), float(mid_xy[1]), height - 0.03],
+            radius=rail_radius,
+            height=seg_len,
+            axis=rail_axis,
+            density=100.0,
+            name=f"{name_prefix}_top_rail_seg{seg_i + 1}",
+        )
+        scene.add_cylinder(
+            center=[float(mid_xy[0]), float(mid_xy[1]), 0.50 * height],
+            radius=rail_radius * 0.8,
+            height=seg_len,
+            axis=rail_axis,
+            density=100.0,
+            name=f"{name_prefix}_mid_rail_seg{seg_i + 1}",
+        )
+
+        # Solid vertical fence posts spaced along segment
+        n_spans = max(1, int(round(seg_len / post_spacing)))
+        for k in range(n_spans + 1):
+            if seg_i > 0 and k == 0:
+                continue  # avoid duplicating shared corner post
+            xy = p0 + (k / n_spans) * delta
+            post_coords.append((float(xy[0]), float(xy[1])))
+
+    for p_idx, (px, py) in enumerate(post_coords):
+        scene.add_cylinder(
+            center=[px, py, 0.5 * (height + 0.05)],
+            radius=post_radius,
+            height=height + 0.05,
+            axis=[0.0, 0.0, 1.0],
+            density=100.0,
+            name=f"{name_prefix}_post_{p_idx + 1}",
+        )
+
+
 def build_forest_scene() -> Scene:
-    """Builds a ~22m x 22m open-sky forest clearing with a rustic cabin and multi-part trees.
+    """Builds a ~22m x 22m open-sky forest clearing with a rustic cabin, chain-link fence,
+    dense ground shrubs, and multi-part trees.
 
     Features:
-      - Open-sky forest floor with fallen log, boulders, and porous understory bushes.
+      - Open-sky forest floor with fallen log, boulders, and abundant porous ground shrubs.
       - Rustic cabin on the +X side with an open swung door, 4 partially transparent
         windows (glass density=8.5), pitched gable roof, chimney, and interior props.
-      - 11 trees surrounding the clearing with solid cylindrical trunks, angled branches,
+      - Big 2-segment semi-transparent chain-link fence (~43% normal-incidence return)
+        with solid steel posts/rails occluding the West & North-West trees and shrubs.
+      - 12 trees surrounding the clearing with solid cylindrical trunks, angled branches,
         and low-density volumetric foliage canopies at both the top and side branches.
     """
     scene = Scene()
@@ -319,13 +402,50 @@ def build_forest_scene() -> Scene:
     )
     scene.add_sphere(center=[-2.4, 4.8, 0.28], radius=0.60, density=100.0, name="boulder_1")
     scene.add_sphere(center=[3.6, -4.6, 0.22], radius=0.45, density=100.0, name="boulder_2")
-    scene.add_sphere(center=[3.4, 3.3, 0.55], radius=0.85, density=0.35, name="understory_bush_1")
-    scene.add_sphere(center=[-4.8, 1.9, 0.60], radius=0.95, density=0.30, name="understory_bush_2")
 
-    # 2. Cabin on the +X side of the clearing (facing the sensor clearing)
+    # Abundant porous ground shrubs & understory bushes (multi-lobe & standalone)
+    shrub_specs = [
+        # (name, (x, y, z), radius, density)
+        ("understory_bush_1",      ( 3.4,  3.3, 0.55), 0.85, 0.35),
+        ("understory_bush_2",      (-4.8,  1.9, 0.60), 0.95, 0.30),
+        ("ground_shrub_NW_1",      (-4.2,  3.0, 0.42), 0.72, 0.55),
+        ("ground_shrub_NW_2",      (-3.6,  3.2, 0.35), 0.55, 0.45),
+        ("ground_shrub_W_1",       (-4.5, -0.5, 0.48), 0.82, 0.40),
+        ("ground_shrub_W_2",       (-6.4,  1.4, 0.58), 0.95, 0.35),
+        ("ground_shrub_SW_1",      (-2.8, -3.7, 0.45), 0.78, 0.50),
+        ("ground_shrub_SW_2",      (-3.4, -4.1, 0.38), 0.62, 0.45),
+        ("ground_shrub_S_1",       (-1.5, -3.9, 0.40), 0.70, 0.60),
+        ("ground_shrub_S_2",       ( 0.8, -4.2, 0.50), 0.85, 0.38),
+        ("ground_shrub_SE_1",      ( 2.6, -4.1, 0.44), 0.76, 0.52),
+        ("ground_shrub_SE_2",      ( 3.2, -3.6, 0.34), 0.55, 0.48),
+        ("ground_shrub_N_1",       (-0.4,  4.8, 0.52), 0.88, 0.42),
+        ("ground_shrub_N_2",       ( 2.4,  4.9, 0.48), 0.80, 0.50),
+        ("ground_shrub_NE_1",      ( 4.4,  3.8, 0.46), 0.75, 0.45),
+        ("ground_shrub_clearing_1",(-1.2,  3.3, 0.34), 0.58, 0.65),
+        ("ground_shrub_clearing_2",( 1.7, -3.3, 0.36), 0.62, 0.55),
+        ("ground_shrub_cabin_N",   ( 4.1,  2.7, 0.42), 0.68, 0.58),
+        ("ground_shrub_cabin_S",   ( 4.1, -2.8, 0.45), 0.72, 0.52),
+    ]
+    for s_name, s_xyz, s_r, s_d in shrub_specs:
+        scene.add_sphere(center=list(s_xyz), radius=s_r, density=s_d, name=s_name)
+
+    # 2. Big 2-segment semi-transparent chain-link fence occluding West & North-West trees/shrubs
+    #    Clear of the r=2.5m sensor orbit while sitting directly in front of tree_sapling_SW,
+    #    tree_W1, tree_NW1, tree_N1, and deep forest trees behind them.
+    add_chain_link_fence(
+        scene,
+        waypoints_xy=[(-3.2, -2.9), (-3.2, 3.6), (2.4, 4.4)],
+        height=2.30,
+        mesh_thickness=0.04,
+        mesh_density=14.0,
+        post_spacing=2.1,
+        name_prefix="chain_link_fence",
+    )
+
+    # 3. Cabin on the +X side of the clearing (facing the sensor clearing)
     add_cabin(scene, x_front=4.6, y_center=0.0, wall_density=100.0, glass_density=8.5)
 
-    # 3. Trees ringing the clearing (clear of the r=2.5m orbit and cabin front sightline)
+    # 4. Trees ringing the clearing (clear of the r=2.5m orbit and cabin front sightline)
     tree_specs = [
         # (name, (x, y), trunk_h, trunk_r, crown_r, n_branches, foliage_dens, az_off, lean)
         ("tree_sapling_SW", (-3.6, -1.6), 3.0, 0.14, 0.95, 2, 0.18,  20.0, ( 0.03, -0.02)),
