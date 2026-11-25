@@ -309,7 +309,7 @@ class HashGrid3D(nn.Module):
         log2_hashmap_size: Log2 of entries per level table (default 16 -> 65,536).
         base_resolution: Coarsest grid resolution per axis (default 16).
         max_resolution: Finest grid resolution per axis (default 512).
-        bound: Half-extent of cubic scene AABB [-bound, +bound]^3 in meters (default 8.0).
+        bound: Half-extent of cubic scene AABB [-bound, +bound]^3 in meters (default 15.0).
         backend: 'auto' (default), 'triton', 'tcnn', or 'pytorch'.
     """
 
@@ -320,7 +320,7 @@ class HashGrid3D(nn.Module):
         log2_hashmap_size: int = 16,
         base_resolution: int = 16,
         max_resolution: int = 512,
-        bound: float = 8.0,
+        bound: float = 15.0,
         backend: str = "auto",
     ):
         super().__init__()
@@ -463,7 +463,7 @@ class HashSCKNetwork(nn.Module):
     Args:
         num_knots: Number of candidate knots K placed along each ray (default 32).
         s_min: Near bound distance along ray in meters (default 0.1).
-        s_max: Far bound distance along ray in meters (default 8.0).
+        s_max: Far bound distance along ray in meters (default 15.0).
         hidden_dim: Hidden dimension of compact MLP decoders (default 64).
         num_hidden_blocks: Residual blocks in knot shift decoder (default 1).
         num_rounds: Number of self-conditioning refinement rounds R (default 2).
@@ -485,23 +485,23 @@ class HashSCKNetwork(nn.Module):
 
     def __init__(
         self,
-        num_knots: int = 32,
-        s_min: float = 0.1,
-        s_max: float = 8.0,
-        hidden_dim: int = 64,
-        num_hidden_blocks: int = 1,
-        num_rounds: int = 2,
-        max_displacement: float = 1.0,
-        cdf_mode: str = "softmax",
-        local_cdf: bool = True,
-        use_viewdir: bool = False,
-        n_levels: int = 12,
-        n_features: int = 2,
-        log2_hashmap_size: int = 16,
-        base_resolution: int = 16,
-        max_resolution: int = 512,
-        scene_bound: Optional[float] = None,
-        hash_backend: str = "auto",
+        num_knots: int = 32,                  # [Fidelity, Speed] Spline knots K/ray. More = finer depth/multi-surface resolution; scales hash lookups (2K-1/round) & MLP compute O(K).
+        s_min: float = 0.1,                   # [Fidelity] Near pinned ray bound (m). Keep tight to closest valid return to avoid wasting knot spacing.
+        s_max: float = 15.0,                  # [Fidelity] Far pinned ray bound (m) & default scene_bound. Tightening to max hit range boosts knot density for free.
+        hidden_dim: int = 64,                 # [Fidelity, Speed] Width H of shift/CDF/ray-drop MLPs. Helps resolve hash collisions; scales MLP compute ~O(H^2 * K * R) (main MLP bottleneck).
+        num_hidden_blocks: int = 1,           # [Fidelity, Speed] Residual blocks in knot-shift MLP only (not cdf_mlp). More = smarter knot placement; 0 is fastest.
+        num_rounds: int = 3,                  # [Fidelity, Speed] Self-conditioning passes R. More = tighter surface bracketing, but scales total forward/backward/loss time ~O(R).
+        max_displacement: float = 1.0,        # [Fidelity] Per-round knot shift cap (m), paired with 0.45*gap. Rarely active at K=32, s_max=8 unless K is small or s_max is large.
+        cdf_mode: str = "softmax",            # [Fidelity] 'softmax' (width-aware + escape bin, smoother grads) vs 'hazard' (Beer-Lambert quadrature, stricter volumetric additivity).
+        local_cdf: bool = True,               # [Fidelity, Speed] True = 3D hash(x_mid) only -> best cross-ray consistency & novel views; False = adds ray_feat (+H inputs, slightly slower).
+        use_viewdir: bool = False,            # [Fidelity] Appends unit ray_d (+3 dims) to cdf_mlp. Enable only for anisotropic/view-dependent returns; False preserves isotropic 3D consistency.
+        n_levels: int = 16,                   # [Fidelity, Speed, Hashmap] Multi-res grid scales (base -> max). More = smoother multi-scale detail; scales hashmap VRAM & kernel work O(L).
+        n_features: int = 2,                  # [Fidelity, Speed, Hashmap] Channels/entry; scales hashmap VRAM O(F). Note: fused Triton kernel requires n_features=2 (else falls back to slow PyTorch without tcnn).
+        log2_hashmap_size: int = 18,          # [Fidelity, Hashmap] Entries/level T=2^P (16 -> 65,536). Top fidelity lever for fewer fine-level collisions at ~O(1) compute; doubles hashmap VRAM per +1 (~4x incl. Adam+grad).
+        base_resolution: int = 18,            # [Fidelity] Coarsest grid resolution across [-bound, +bound]. Lower smooths sparse views; higher shifts levels toward finer detail.
+        max_resolution: int = 2048,            # [Fidelity] Finest grid resolution across 2*bound (voxel = 2*bound/max_res). Raise (1024-2048) with larger log2_hashmap_size for sharper thin edges.
+        scene_bound: Optional[float] = None,  # [Fidelity] Half-extent of cubic 3D hash grid [-bound, +bound]^3 (default s_max). Free fidelity boost when tightened to actual scene AABB.
+        hash_backend: str = "auto",           # [Speed, Hashmap] 'tcnn' (fastest + dense coarse levels, if installed) > 'triton' (fast fused CUDA, n_features=2) >> 'pytorch' (slow fallback).
     ):
         super().__init__()
         self.num_knots = num_knots
@@ -745,7 +745,7 @@ def compute_hash_sck_loss(
     weights: Optional[List[float]] = None,
     lambda_raydrop: float = 0.1,
     lambda_sky_cdf: float = 0.1,
-    s_max: float = 8.0,
+    s_max: float = 15.0,
 ) -> torch.Tensor:
     """Zero-sync exact grid-free Root-CRPS loss + sky empty-space carving + ray-drop BCE.
 

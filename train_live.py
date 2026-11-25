@@ -139,6 +139,9 @@ VIEWER_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="btn-row">
       <button id="btn-mode">Mode: Sample (M)</button>
+      <button id="btn-unobs">Unobserved: Off (U)</button>
+    </div>
+    <div class="btn-row">
       <button id="btn-cam">Reset Cam</button>
     </div>
     <div class="row">
@@ -159,6 +162,10 @@ VIEWER_HTML = r"""<!DOCTYPE html>
       <div class="row">
         <label for="rng-iso-clump">Clump isolate (<span id="lbl-clump">0.45</span>)</label>
         <input id="rng-iso-clump" type="range" min="0.00" max="1.00" step="0.05" value="0.45" />
+      </div>
+      <div class="row">
+        <label for="chk-mask-unobs">Mask unobserved</label>
+        <input id="chk-mask-unobs" type="checkbox" checked style="accent-color: #58a6ff; width: 15px; height: 15px;" />
       </div>
       <div class="row">
         <label for="sel-mres">MC Grid res</label>
@@ -208,7 +215,7 @@ VIEWER_HTML = r"""<!DOCTYPE html>
     </div>
     <div>
       <div class="cbar" id="cbar-grad"></div>
-      <div class="cbar-labels"><span id="cbar-min">0.0</span><span id="cbar-mid">Range (m)</span><span id="cbar-max">8.0</span></div>
+      <div class="cbar-labels"><span id="cbar-min">0.0</span><span id="cbar-mid">Range (m)</span><span id="cbar-max">15.0</span></div>
     </div>
   </div>
   <div class="footer-hint">Left-drag: Orbit &bull; Right-drag: Pan &bull; Scroll: Zoom</div>
@@ -279,10 +286,93 @@ function applyGtMode() {
   document.getElementById('sel-gt').value = gtMode;
 }
 
-const sensorMarker = new THREE.Mesh(
-  new THREE.SphereGeometry(0.11, 20, 16),
-  new THREE.MeshStandardMaterial({ color: 0xff5a4f, emissive: 0x661510, roughness: 0.3 })
-);
+// Cartoon Velodyne VLP-32C (Ultra Puck) 3D LiDAR model centered at optical origin
+function buildCartoonVLP32C() {
+  const root = new THREE.Group();
+  // Rotate local Y-up cylinders into scene Z-up so +Y inside body maps to world +Z
+  const body = new THREE.Group();
+  body.rotation.x = Math.PI / 2;
+  root.add(body);
+
+  const R = 0.135; // Stylized cartoon Ultra Puck radius (~2.6x real 51.5mm for clear visibility)
+  const aluMat = new THREE.MeshStandardMaterial({ color: 0xcbd5e1, metalness: 0.72, roughness: 0.26 });
+  const aluTopMat = new THREE.MeshStandardMaterial({ color: 0xdbe4ee, metalness: 0.70, roughness: 0.24 });
+  const darkMat = new THREE.MeshStandardMaterial({ color: 0x1e2530, metalness: 0.25, roughness: 0.55 });
+  const blueRingMat = new THREE.MeshStandardMaterial({ color: 0x1d8cf8, emissive: 0x0a3d7a, roughness: 0.25, metalness: 0.35 });
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: 0x0b101b,
+    roughness: 0.12,
+    metalness: 0.45,
+  });
+
+  // 1. Rubber mounting pad & lower brushed-aluminum base
+  const pad = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.90, R * 0.86, 0.016, 28), darkMat);
+  pad.position.y = -0.115;
+  body.add(pad);
+
+  const base = new THREE.Mesh(new THREE.CylinderGeometry(R, R * 0.96, 0.056, 32), aluMat);
+  base.position.y = -0.079;
+  body.add(base);
+
+  // Subtle green status LED on front bezel (+X)
+  const led = new THREE.Mesh(
+    new THREE.SphereGeometry(0.0085, 10, 8),
+    new THREE.MeshStandardMaterial({ color: 0x22c55e, emissive: 0x16a34a, emissiveIntensity: 1.5, roughness: 0.2 })
+  );
+  led.position.set(R * 0.99, -0.079, 0);
+  body.add(led);
+
+  // Rear armored cable boot & short cartoon pigtail (-X)
+  const boot = new THREE.Mesh(new THREE.CylinderGeometry(0.017, 0.021, 0.044, 12), darkMat);
+  boot.rotation.z = Math.PI / 2;
+  boot.position.set(-R - 0.016, -0.082, 0);
+  body.add(boot);
+
+  const cableCurve = new THREE.QuadraticBezierCurve3(
+    new THREE.Vector3(-R - 0.036, -0.082, 0),
+    new THREE.Vector3(-R - 0.078, -0.088, 0),
+    new THREE.Vector3(-R - 0.095, -0.135, 0)
+  );
+  const cable = new THREE.Mesh(new THREE.TubeGeometry(cableCurve, 10, 0.010, 8, false), darkMat);
+  body.add(cable);
+
+  // 2. Signature Velodyne blue accent trim rings framing the optical window
+  const ringGeo = new THREE.TorusGeometry(R * 1.005, 0.0055, 10, 32);
+  const lowerRing = new THREE.Mesh(ringGeo, blueRingMat);
+  lowerRing.rotation.x = Math.PI / 2;
+  lowerRing.position.y = -0.051;
+  body.add(lowerRing);
+
+  const upperRing = new THREE.Mesh(ringGeo, blueRingMat);
+  upperRing.rotation.x = Math.PI / 2;
+  upperRing.position.y = 0.051;
+  body.add(upperRing);
+
+  // 3. Glossy dark IR optical window band (centered at y=0 optical origin)
+  const windowBand = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.97, R * 0.97, 0.102, 32), glassMat);
+  body.add(windowBand);
+
+  // 4. Two-tier chamfered aluminum top cap & dark center medallion
+  const topRim = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.96, R, 0.044, 32), aluTopMat);
+  topRim.position.y = 0.073;
+  body.add(topRim);
+
+  const topBevel = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.78, R * 0.96, 0.018, 32), aluTopMat);
+  topBevel.position.y = 0.104;
+  body.add(topBevel);
+
+  const topBadge = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.48, R * 0.48, 0.006, 24), darkMat);
+  topBadge.position.y = 0.114;
+  body.add(topBadge);
+
+  const topDot = new THREE.Mesh(new THREE.CylinderGeometry(R * 0.14, R * 0.14, 0.008, 16), blueRingMat);
+  topDot.position.y = 0.115;
+  body.add(topDot);
+
+  return root;
+}
+
+const sensorMarker = buildCartoonVLP32C();
 scene.add(sensorMarker);
 
 // --- 3 Rendering Modes: Flat Points, Instanced 3D Spheres, Instanced Normal Patches (Surfels) ---
@@ -333,6 +423,41 @@ let lastMeshVerts = null, lastMeshNorms = null, lastMeshIdx = null, lastMeshRegi
 let lastMeshVersion = -1;
 let meshTrisCount = 0;
 let meshMsLast = 0;
+
+// Translucent 3D mesh highlighting online-tracked UNOBSERVED / blind-zone regions
+const unobsGeom = new THREE.BufferGeometry();
+const unobsMat = new THREE.MeshStandardMaterial({
+  color: 0xef4444,
+  emissive: 0x7f1d1d,
+  emissiveIntensity: 0.35,
+  transparent: true,
+  opacity: 0.28,
+  roughness: 0.35,
+  metalness: 0.05,
+  depthWrite: false,
+  side: THREE.FrontSide,
+});
+const unobsMesh = new THREE.Mesh(unobsGeom, unobsMat);
+unobsMesh.frustumCulled = false;
+unobsMesh.visible = false;
+scene.add(unobsMesh);
+
+let showUnobs = false;
+let lastUnobsVersion = -1;
+let lastObsPct = 0.0;
+
+function updateUnobsButton() {
+  const btn = document.getElementById('btn-unobs');
+  if (showUnobs) {
+    const pctStr = lastObsPct > 0 ? ` (${(100 - lastObsPct).toFixed(0)}% blind)` : '';
+    btn.textContent = `Unobserved: On${pctStr} (U)`;
+    btn.classList.add('primary');
+  } else {
+    btn.textContent = 'Unobserved: Off (U)';
+    btn.classList.remove('primary');
+  }
+  unobsMesh.visible = showUnobs && lastUnobsVersion > 0;
+}
 
 function ensureInstancedMeshes(count) {
   const needed = Math.max(1, count);
@@ -391,7 +516,7 @@ const _col = new THREE.Color();
 
 // Client-side state
 let lastPts = null, lastNorms = null, lastRanges = null, lastProbs = null;
-let currentSMax = 8.0;
+let currentSMax = 15.0;
 let colorMode = 'range';
 let geomMode = 'patches';
 let elemSize = 0.08;
@@ -615,6 +740,13 @@ async function loadScene() {
     if (data.mesh_res !== undefined) {
       document.getElementById('sel-mres').value = String(data.mesh_res);
     }
+    if (data.mask_unobserved !== undefined) {
+      document.getElementById('chk-mask-unobs').checked = Boolean(data.mask_unobserved);
+    }
+    if (data.show_unobserved !== undefined) {
+      showUnobs = Boolean(data.show_unobserved);
+      updateUnobsButton();
+    }
     syncMeshControlsUI();
     if (data.color_by) {
       colorMode = data.color_by === 'probability' ? 'prob' : data.color_by;
@@ -636,14 +768,26 @@ async function loadScene() {
 
     const palette = [0x4ea8de, 0x56cfe1, 0x64dfdf, 0x80ffdb, 0xf77f00, 0xfcbf49, 0xe63946, 0xa8dadc];
     (data.scene_objects || []).forEach((obj, idx) => {
-      const isWall = obj.density >= 50;
-      const color = isWall ? 0x4b5c73 : palette[idx % palette.length];
-      const opacity = isWall ? 0.10 : 0.28;
+      const name = (obj.name || '').toLowerCase();
+      const isFoliage =
+        name.includes('foliage') || name.includes('crown') || name.includes('leaf') ||
+        name.includes('leaves') || name.includes('canopy') || name.includes('bush');
+      const isWood = name.includes('trunk') || name.includes('branch') || name.includes('log');
+      const isWindow = name.includes('window');
+      const isWall = obj.density >= 50 && !isWood;
+
+      let color = palette[idx % palette.length];
+      let opacity = 0.28;
+      if (isFoliage) { color = 0x22c55e; opacity = 0.26; }
+      else if (isWood) { color = 0x8b5a2b; opacity = 0.24; }
+      else if (isWindow) { color = 0x38bdf8; opacity = 0.20; }
+      else if (isWall) { color = 0x4b5c73; opacity = 0.10; }
+
       const mat = new THREE.MeshStandardMaterial({
         color,
         transparent: true,
         opacity,
-        roughness: isWall ? 0.7 : 0.22,
+        roughness: isWall ? 0.7 : 0.28,
         metalness: 0.05,
         depthWrite: false,
         side: isWall ? THREE.DoubleSide : THREE.FrontSide,
@@ -785,6 +929,39 @@ async function pollMesh() {
   setTimeout(pollMesh, 120);
 }
 
+// Poll binary 3D Unobserved / Blind-Zone mesh from /api/unobs
+async function pollUnobs() {
+  try {
+    if (showUnobs) {
+      const resp = await fetch(`/api/unobs?v=${lastUnobsVersion}`, { cache: 'no-store' });
+      if (resp.status === 200) {
+        const buf = await resp.arrayBuffer();
+        const dv = new DataView(buf);
+        const metaLen = dv.getUint32(0, true);
+        const metaStr = new TextDecoder().decode(new Uint8Array(buf, 4, metaLen));
+        const meta = JSON.parse(metaStr);
+
+        let offset = (4 + metaLen + 3) & ~3;
+        const nv = meta.num_verts || 0;
+        const nt = meta.num_tris || 0;
+        const verts = new Float32Array(buf, offset, nv * 3);
+        const norms = new Float32Array(buf, offset + nv * 12, nv * 3);
+        const indices = new Uint32Array(buf, offset + nv * 24, nt * 3);
+
+        lastUnobsVersion = meta.version;
+        lastObsPct = meta.observed_pct || 0.0;
+
+        unobsGeom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+        unobsGeom.setAttribute('normal', new THREE.BufferAttribute(norms, 3));
+        unobsGeom.setIndex(new THREE.BufferAttribute(indices, 1));
+        unobsGeom.computeBoundingSphere();
+        updateUnobsButton();
+      }
+    }
+  } catch (e) {}
+  setTimeout(pollUnobs, 150);
+}
+
 async function sendControl(action, extra = {}) {
   try {
     await fetch('/api/control', {
@@ -845,16 +1022,31 @@ function pushMeshSettings(immediate = false) {
   const iso = parseFloat(document.getElementById('rng-iso').value);
   const clump = parseFloat(document.getElementById('rng-iso-clump').value);
   const res = parseInt(document.getElementById('sel-mres').value, 10);
+  const maskUnobs = document.getElementById('chk-mask-unobs').checked;
   document.getElementById('lbl-iso').textContent = iso.toFixed(2);
   document.getElementById('lbl-clump').textContent = clump.toFixed(2);
   clearTimeout(meshTimer);
-  const doSend = () => sendControl('set_mesh', { enabled: isMeshMode(), iso_level: iso, clump_isolate: clump, grid_res: res });
+  const doSend = () => sendControl('set_mesh', {
+    enabled: isMeshMode(),
+    iso_level: iso,
+    clump_isolate: clump,
+    grid_res: res,
+    mask_unobserved: maskUnobs,
+  });
   if (immediate) doSend();
   else meshTimer = setTimeout(doSend, 60);
 }
 
+function toggleUnobs() {
+  showUnobs = !showUnobs;
+  updateUnobsButton();
+  sendControl('set_unobs', { enabled: showUnobs });
+}
+
+document.getElementById('btn-unobs').addEventListener('click', toggleUnobs);
 document.getElementById('rng-iso').addEventListener('input', () => pushMeshSettings(false));
 document.getElementById('rng-iso-clump').addEventListener('input', () => pushMeshSettings(false));
+document.getElementById('chk-mask-unobs').addEventListener('change', () => pushMeshSettings(true));
 document.getElementById('sel-mres').addEventListener('change', () => pushMeshSettings(true));
 
 document.getElementById('sel-geom').addEventListener('change', (e) => {
@@ -889,6 +1081,7 @@ window.addEventListener('keydown', (e) => {
   if (k === ' ' || k === 'p') { e.preventDefault(); sendControl('toggle_pause'); }
   else if (k === 'r') sendControl('reset');
   else if (k === 'm') sendControl('toggle_method');
+  else if (k === 'u') toggleUnobs();
   else if (k === 'v') {
     geomMode = GEOM_CYCLE[(GEOM_CYCLE.indexOf(geomMode) + 1) % GEOM_CYCLE.length];
     document.getElementById('sel-geom').value = geomMode;
@@ -916,6 +1109,7 @@ function animate() {
 loadScene();
 pollFrame();
 pollMesh();
+pollUnobs();
 animate();
 </script>
 </body>
@@ -1366,6 +1560,126 @@ def run_marching_cubes_vtk(
     return verts, norms, regions, indices
 
 
+class OnlineVisibilityGrid:
+    """Online GPU-resident 3D observed/unobserved voxel tracker.
+
+    Incrementally carves observed space directly from incoming LiDAR batches
+    (~0.7 ms/batch, zero preprocessing required):
+      - Hitting rays mark [s_min, hit_range + margin] as observed (1) and leave
+        occluded regions beyond the hit surface unobserved (0).
+      - Sky / non-returning rays mark [s_min, s_max] as observed free space (1).
+    """
+
+    def __init__(
+        self,
+        bbox_min: Tuple[float, float, float],
+        bbox_max: Tuple[float, float, float],
+        grid_res: int = 96,
+        s_min: float = 0.1,
+        s_max: float = 15.0,
+        samples_per_ray: int = 48,
+        device: Optional[torch.device] = None,
+    ):
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        x0, y0, z0 = bbox_min
+        x1, y1, z1 = bbox_max
+        sx, sy, sz = x1 - x0, y1 - y0, z1 - z0
+        max_xy = max(sx, sy, 1e-3)
+        self.nx = max(16, int(round(grid_res * (sx / max_xy))))
+        self.ny = max(16, int(round(grid_res * (sy / max_xy))))
+        self.nz = max(16, int(round(grid_res * (sz / max_xy))))
+        self.origin = (x0, y0, z0)
+        self.spacing = (
+            sx / max(1, self.nx - 1),
+            sy / max(1, self.ny - 1),
+            sz / max(1, self.nz - 1),
+        )
+        self.voxel_size = max(self.spacing)
+        self.hit_margin = 1.5 * self.voxel_size  # include hit surface voxel, not behind it
+        self.s_min = float(s_min)
+        self.s_max = float(s_max)
+
+        self.bbox_min_t = torch.tensor([x0, y0, z0], device=self.device, dtype=torch.float32)
+        dims_t = torch.tensor([self.nx, self.ny, self.nz], device=self.device, dtype=torch.float32)
+        span_t = torch.tensor([sx, sy, sz], device=self.device, dtype=torch.float32)
+        self.inv_span = (dims_t - 1.0) / torch.clamp(span_t, min=1e-6)
+        self.t_frac = torch.linspace(0.0, 1.0, samples_per_ray, device=self.device, dtype=torch.float32)
+
+        self.grid = torch.zeros((self.nx * self.ny * self.nz,), device=self.device, dtype=torch.uint8)
+
+    def reset(self) -> None:
+        """Clears observed mask back to 0 (e.g. when resetting weights)."""
+        self.grid.zero_()
+
+    @torch.no_grad()
+    def update_batch(
+        self,
+        ray_o: torch.Tensor,
+        ray_d: torch.Tensor,
+        hit_range: torch.Tensor,
+        hit_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Marks voxels traversed by the observed segment of each ray in the batch."""
+        r = hit_range.view(-1)
+        if hit_mask is not None:
+            m = hit_mask.view(-1)
+            t_end = torch.where(
+                m > 0.5,
+                torch.clamp(r + self.hit_margin, max=self.s_max),
+                torch.full_like(r, self.s_max),
+            )
+        else:
+            t_end = torch.clamp(r + self.hit_margin, max=self.s_max)
+
+        ts = self.s_min + self.t_frac.unsqueeze(0) * torch.clamp(t_end - self.s_min, min=0.0).unsqueeze(1)
+        pts = ray_o.unsqueeze(1) + ts.unsqueeze(-1) * ray_d.unsqueeze(1)  # (B, S, 3)
+        ijk = torch.round((pts - self.bbox_min_t) * self.inv_span).long()
+        inb = (
+            (ijk[..., 0] >= 0) & (ijk[..., 0] < self.nx)
+            & (ijk[..., 1] >= 0) & (ijk[..., 1] < self.ny)
+            & (ijk[..., 2] >= 0) & (ijk[..., 2] < self.nz)
+        )
+        ijk_v = ijk[inb]
+        if ijk_v.numel() > 0:
+            flat = (ijk_v[:, 0] * self.ny + ijk_v[:, 1]) * self.nz + ijk_v[:, 2]
+            self.grid[flat] = 1
+
+    @torch.no_grad()
+    def get_observed_mask_numpy(self, target_shape: Tuple[int, int, int]) -> np.ndarray:
+        """Returns a float32 [nx, ny, nz] observed mask resampled to target_shape."""
+        obs_5d = self.grid.view(1, 1, self.nx, self.ny, self.nz).float()
+        if target_shape != (self.nx, self.ny, self.nz):
+            obs_5d = F.interpolate(obs_5d, size=target_shape, mode="trilinear", align_corners=True)
+        # Small 1-voxel dilation/blur keeps hit boundaries smooth without leaking into shadows
+        obs_5d = _gaussian_blur_3d(obs_5d, sigma=0.7, radius=1)
+        return (obs_5d[0, 0] > 0.15).float().cpu().numpy().astype(np.float32)
+
+    @torch.no_grad()
+    def extract_unobserved_mesh_vtk(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Extracts a smooth 3D Marching Cubes mesh enclosing all UNOBSERVED voxels."""
+        obs_5d = self.grid.view(1, 1, self.nx, self.ny, self.nz).float()
+        observed_pct = float(obs_5d.mean().item() * 100.0)
+        unobs_5d = 1.0 - obs_5d
+        unobs_smooth = _gaussian_blur_3d(unobs_5d, sigma=0.8, radius=2)[0, 0].cpu().numpy().astype(np.float32)
+
+        # Close outer 1-voxel boundary so blind cones & pillar shadows form crisp closed shells
+        unobs_smooth[0, :, :] = 0.0
+        unobs_smooth[-1, :, :] = 0.0
+        unobs_smooth[:, 0, :] = 0.0
+        unobs_smooth[:, -1, :] = 0.0
+        unobs_smooth[:, :, 0] = 0.0
+        unobs_smooth[:, :, -1] = 0.0
+
+        verts, norms, _, indices = run_marching_cubes_vtk(
+            unobs_smooth,
+            self.origin,
+            self.spacing,
+            iso_level=0.5,
+            min_clump_verts=40,
+        )
+        return verts, norms, indices, observed_pct
+
+
 # ==============================================================================
 # 3. Shared Binary Frame Store + Stdlib HTTP Server
 # ==============================================================================
@@ -1381,6 +1695,7 @@ class LiveServerState:
         self.rerender_event = threading.Event()
         self.sensor_dirty_event = threading.Event()
         self.mesh_dirty_event = threading.Event()
+        self.unobs_dirty_event = threading.Event()
 
         self.scene_json = json.dumps(scene_payload).encode("utf-8")
         self.render_method = args.render_method
@@ -1390,9 +1705,13 @@ class LiveServerState:
         self.mesh_enabled = args.point_style in ("mesh", "mesh+patches")
         self.mesh_iso = float(args.mesh_iso)
         self.clump_isolate = float(args.clump_isolate)
+        self.mask_unobserved = not args.no_mask_unobserved
         self.mesh_res = int(args.mesh_res)
         self.mesh_version = 0
         self.latest_mesh_blob: Optional[bytes] = None
+        self.unobs_enabled = bool(args.show_unobserved)
+        self.unobs_version = 0
+        self.latest_unobs_blob: Optional[bytes] = None
         self.s_max = float(args.s_max)
         self.version = 0
         self.loss_history: List[float] = []
@@ -1530,6 +1849,34 @@ class LiveServerState:
                 return None
             return self.latest_mesh_blob
 
+    def publish_unobs(
+        self,
+        verts: np.ndarray,
+        norms: np.ndarray,
+        indices: np.ndarray,
+        observed_pct: float,
+        epoch_float: float,
+    ) -> None:
+        with self.lock:
+            self.unobs_version += 1
+            meta = {
+                "version": self.unobs_version,
+                "num_verts": int(len(verts)),
+                "num_tris": int(len(indices) // 3),
+                "observed_pct": float(observed_pct),
+                "epoch_float": float(epoch_float),
+            }
+            meta_bytes = json.dumps(meta).encode("utf-8")
+            pad = (-len(meta_bytes)) % 4
+            header = struct.pack("<I", len(meta_bytes)) + meta_bytes + (b"\x00" * pad)
+            self.latest_unobs_blob = header + verts.tobytes() + norms.tobytes() + indices.tobytes()
+
+    def get_unobs_if_newer(self, client_version: int) -> Optional[bytes]:
+        with self.lock:
+            if self.latest_unobs_blob is None or self.unobs_version == client_version:
+                return None
+            return self.latest_unobs_blob
+
 
 def start_http_server(state: LiveServerState, host: str, port: int) -> ThreadingHTTPServer:
     html_bytes = VIEWER_HTML.encode("utf-8")
@@ -1576,6 +1923,23 @@ def start_http_server(state: LiveServerState, host: str, port: int) -> Threading
                 except ValueError:
                     client_v = -1
                 blob = state.get_mesh_if_newer(client_v)
+                if blob is None:
+                    self.send_response(204)
+                    self.end_headers()
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(blob)))
+                    self.end_headers()
+                    self.wfile.write(blob)
+            elif parsed.path == "/api/unobs":
+                qs = urllib.parse.parse_qs(parsed.query)
+                try:
+                    client_v = int(qs.get("v", ["-1"])[0])
+                except ValueError:
+                    client_v = -1
+                blob = state.get_unobs_if_newer(client_v)
                 if blob is None:
                     self.send_response(204)
                     self.end_headers()
@@ -1638,9 +2002,16 @@ def start_http_server(state: LiveServerState, host: str, port: int) -> Threading
                         state.mesh_iso = max(0.01, min(0.99, float(payload["iso_level"])))
                     if "clump_isolate" in payload:
                         state.clump_isolate = max(0.0, min(1.0, float(payload["clump_isolate"])))
+                    if "mask_unobserved" in payload:
+                        state.mask_unobserved = bool(payload["mask_unobserved"])
                     if "grid_res" in payload:
                         state.mesh_res = max(32, min(160, int(payload["grid_res"])))
                 state.mesh_dirty_event.set()
+                state.rerender_event.set()
+            elif cmd == "set_unobs":
+                with state.lock:
+                    state.unobs_enabled = bool(payload.get("enabled", False))
+                state.unobs_dirty_event.set()
                 state.rerender_event.set()
 
             resp = b'{"ok":true}'
@@ -1695,7 +2066,7 @@ def parse_args() -> argparse.Namespace:
         help="Epochs between visual updates; supports floats < 1.0 for sub-epoch updates (default: 0.25)",
     )
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: 2048 for hash, 1024 for fourier)")
-    parser.add_argument("--s-max", type=float, default=8.0, help="Max ray range in meters (default: 8.0)")
+    parser.add_argument("--s-max", type=float, default=15.0, help="Max ray range in meters (default: 15.0)")
     parser.add_argument("--num-knots", type=int, default=32, help="Number of spline knots K per ray (default: 32)")
     parser.add_argument("--num-rounds", type=int, default=None, help="Self-conditioning rounds R (default: 2 for hash, 3 for fourier)")
     parser.add_argument("--hidden-dim", type=int, default=None, help="MLP hidden dim (default: 64 for hash, 256 for fourier)")
@@ -1727,6 +2098,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mesh-iso", type=float, default=0.45, help="Initial Marching Cubes iso-level in (0, 1) (default: 0.45)")
     parser.add_argument("--clump-isolate", type=float, default=0.45, help="Difference-of-Gaussians clump isolation strength in [0, 1] (default: 0.45)")
     parser.add_argument("--mesh-res", type=int, default=96, help="Initial Marching Cubes grid resolution (default: 96)")
+    parser.add_argument("--show-unobserved", action="store_true", help="Show translucent 3D overlay of unobserved/blind-zone regions on startup")
+    parser.add_argument("--no-mask-unobserved", action="store_true", help="Do not mask Marching Cubes mesh to online-observed voxels")
     parser.add_argument("--gt-style", type=str, choices=["transparent", "both", "wireframe", "off"], default="transparent", help="Initial ground-truth scene overlay style (default: transparent)")
     parser.add_argument("--no-gt-scene", action="store_true", help="Hide ground-truth room overlay on startup (alias for --gt-style off)")
     parser.add_argument("--save-checkpoint", type=str, default=None, help="Optional path to save trained model weights (.pt)")
@@ -1832,8 +2205,17 @@ def main() -> None:
         flush=True,
     )
 
-    # 4. Start Three.js HTTP server
+    # 4. Start Three.js HTTP server + online GPU 3D visibility tracker
     mesh_bbox_min, mesh_bbox_max = compute_scene_bbox(scene_cfg, args.s_max)
+    vis_grid = OnlineVisibilityGrid(
+        bbox_min=mesh_bbox_min,
+        bbox_max=mesh_bbox_max,
+        grid_res=96,
+        s_min=0.1,
+        s_max=args.s_max,
+        samples_per_ray=48,
+        device=device,
+    )
     cached_vol_info: Dict[str, Any] = {
         "v_smooth": None,
         "v_wide": None,
@@ -1856,6 +2238,8 @@ def main() -> None:
         "render_channels": init_channels,
         "mesh_iso": args.mesh_iso,
         "clump_isolate": args.clump_isolate,
+        "mask_unobserved": not args.no_mask_unobserved,
+        "show_unobserved": args.show_unobserved,
         "mesh_res": args.mesh_res,
         "scene_objects": scene_cfg.get("scene_objects", []),
     }
@@ -1866,11 +2250,26 @@ def main() -> None:
     if not args.no_browser:
         webbrowser.open(url)
 
+    def push_unobs(epoch_float: float) -> None:
+        with state.lock:
+            enabled = state.unobs_enabled
+        if not enabled:
+            return
+        verts, norms, indices, obs_pct = vis_grid.extract_unobserved_mesh_vtk()
+        state.publish_unobs(
+            verts=verts,
+            norms=norms,
+            indices=indices,
+            observed_pct=obs_pct,
+            epoch_float=epoch_float,
+        )
+
     def push_mesh(epoch_float: float, step: int, force_eval: bool = False) -> None:
         with state.lock:
             enabled = state.mesh_enabled
             iso = state.mesh_iso
             clump = state.clump_isolate
+            mask_unobs = state.mask_unobserved
             res = state.mesh_res
         if not enabled:
             return
@@ -1906,6 +2305,9 @@ def main() -> None:
             0.0,
             1.0,
         ).astype(np.float32, copy=False)
+        if mask_unobs and step > 0:
+            obs_mask = vis_grid.get_observed_mask_numpy(vol_eff.shape)
+            vol_eff = vol_eff * obs_mask
         # Zero outer 1-voxel shell so Marching Cubes closes cleanly at bbox walls
         vol_eff[0, :, :] = 0.0
         vol_eff[-1, :, :] = 0.0
@@ -1941,9 +2343,14 @@ def main() -> None:
         append_loss: bool = True,
     ) -> None:
         nonlocal render_rays_o, render_rays_d, render_grid_shape
-        mesh_only_dirty = state.mesh_dirty_event.is_set() and not state.sensor_dirty_event.is_set()
+        aux_only_dirty = (
+            (state.mesh_dirty_event.is_set() or state.unobs_dirty_event.is_set())
+            and not state.sensor_dirty_event.is_set()
+        )
         if state.mesh_dirty_event.is_set():
             state.mesh_dirty_event.clear()
+        if state.unobs_dirty_event.is_set():
+            state.unobs_dirty_event.clear()
         if state.sensor_dirty_event.is_set():
             state.sensor_dirty_event.clear()
             with state.lock:
@@ -1953,7 +2360,7 @@ def main() -> None:
             render_rays_o, render_rays_d, render_grid_shape = build_render_rays(emin, emax, ch)
         with state.lock:
             method = state.render_method
-        if not (mesh_only_dirty and not append_loss):
+        if not (aux_only_dirty and not append_loss):
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t_r0 = time.perf_counter()
@@ -1983,6 +2390,7 @@ def main() -> None:
                 append_loss=append_loss,
             )
         push_mesh(epoch_float, step)
+        push_unobs(epoch_float)
 
     # 5. Train directly on the main thread at 100% native GPU speed
     try:
@@ -1994,6 +2402,7 @@ def main() -> None:
 
             with state.lock:
                 state.loss_history.clear()
+            vis_grid.reset()
             cached_vol_info["v_smooth"] = None
             cached_vol_info["v_wide"] = None
             cached_vol_info["step"] = -1
@@ -2041,6 +2450,9 @@ def main() -> None:
                     ray_d = batch["ray_d"]
                     hit_range = batch["hit_range"]
                     hit_mask = batch["hit_mask"]
+
+                    # Online visibility tracking directly from incoming rays (~0.7 ms/batch)
+                    vis_grid.update_batch(ray_o, ray_d, hit_range, hit_mask)
 
                     if args.origin_slide:
                         ray_o, hit_range, _ = vectorized_gpu_origin_slide(

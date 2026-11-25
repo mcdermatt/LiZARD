@@ -907,41 +907,54 @@ def trace_scene_rays(
         n_enters[obj_i] = n_in
         n_exits[obj_i] = n_out
 
+    # Vectorized hit filter: only inspect objects actually intersected by each ray
+    actual_in_all = np.maximum(t_enters, min_range)
+    actual_out_all = np.minimum(t_exits, max_range)
+    chords_all = actual_out_all - actual_in_all
+    valid_mask = (
+        (t_exits > min_range)
+        & (t_enters < max_range)
+        & (t_enters < t_exits)
+        & (chords_all > 0.0)
+    )
+
+    ray_hits_idx: List[List[int]] = [[] for _ in range(N)]
+    hit_objs, hit_rays = np.nonzero(valid_mask)
+    for obj_i, ray_i in zip(hit_objs.tolist(), hit_rays.tolist()):
+        ray_hits_idx[ray_i].append(obj_i)
+
     results = []
 
     for ray_i in range(N):
+        hit_obj_list = ray_hits_idx[ray_i]
+        if not hit_obj_list:
+            results.append({"hits": [], "remaining_transmittance": 1.0})
+            continue
+
         ray_origin = rays_o[ray_i]
         ray_dir = rays_d[ray_i]
 
         # Collect all valid contacted objects for this ray
         candidate_hits = []
-        for obj_i in range(num_objects):
-            t_in = t_enters[obj_i, ray_i]
-            t_out = t_exits[obj_i, ray_i]
-
-            # Ray hits object if within sensor range
-            if t_out > min_range and t_in < max_range and t_in < t_out:
-                # Clamp entry to min_range if sensor is inside the object
-                actual_in = max(t_in, min_range)
-                actual_out = min(t_out, max_range)
-                chord = max(0.0, actual_out - actual_in)
-
-                if chord > 0.0:
-                    candidate_hits.append({
-                        "t": actual_in,
-                        "t_in": actual_in,
-                        "t_out": actual_out,
-                        "chord": chord,
-                        "point": ray_origin + actual_in * ray_dir,
-                        "point_in": ray_origin + actual_in * ray_dir,
-                        "point_out": ray_origin + actual_out * ray_dir,
-                        "normal": n_enters[obj_i, ray_i],
-                        "normal_in": n_enters[obj_i, ray_i],
-                        "normal_out": n_exits[obj_i, ray_i],
-                        "object_idx": obj_i,
-                        "object_name": scene.objects[obj_i].name,
-                        "density": scene.objects[obj_i].density,
-                    })
+        for obj_i in hit_obj_list:
+            actual_in = float(actual_in_all[obj_i, ray_i])
+            actual_out = float(actual_out_all[obj_i, ray_i])
+            chord = float(chords_all[obj_i, ray_i])
+            candidate_hits.append({
+                "t": actual_in,
+                "t_in": actual_in,
+                "t_out": actual_out,
+                "chord": chord,
+                "point": ray_origin + actual_in * ray_dir,
+                "point_in": ray_origin + actual_in * ray_dir,
+                "point_out": ray_origin + actual_out * ray_dir,
+                "normal": n_enters[obj_i, ray_i],
+                "normal_in": n_enters[obj_i, ray_i],
+                "normal_out": n_exits[obj_i, ray_i],
+                "object_idx": obj_i,
+                "object_name": scene.objects[obj_i].name,
+                "density": scene.objects[obj_i].density,
+            })
 
         # Sort contacts in order of distance from sensor: working outwards
         candidate_hits.sort(key=lambda hit: hit["t_in"])
