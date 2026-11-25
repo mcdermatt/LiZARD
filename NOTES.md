@@ -97,3 +97,16 @@ To maximize training throughput on resource-constrained hardware (e.g. NVIDIA GT
 4. **Precision Considerations (FP32 vs FP16 AMP)**:
    - For compact coordinate MLPs, standard FP32 runs faster than FP16 Automatic Mixed Precision (AMP) on mobile GPUs.
    - The kernel launching overhead of dtype casting and loss scaling (`GradScaler`) outweighs tensor-core savings, and pure FP32 preserves gradient precision for high-frequency positional encodings.
+
+---
+
+### Paper Framing Note: Why Decoupled Hash-SCK Matters for Robotics (vs. PLiNK)
+
+Because `HashSCKNetwork` puts self-conditioned knot placement **in front of** a purely 3D-local readout (`local_cdf=True`: `hash_grid(x) -> cdf_mlp -> cdf_out`), training from raw LiDAR rays automatically carves a **standalone, sensor-model-free 3D volumetric hazard field** alongside the fast ray-CDF predictor:
+
+- **No Multi-View Scan Synthesis & Stitching Required:** Unlike workflows that render novel LiDAR point clouds from multiple viewpoints and merge them into a map, you can query $f(\mathbf{x})$ directly at any $(x, y, z)$ in $O(1)$—enabling instant Marching Cubes meshing (`~20-30 ms` for a 96³ room grid), 3D/2D costmap extraction, and microsecond trajectory collision checking.
+- **Continuous Traversability (Hard vs. Porous Media):** Preserves volumetric return density so downstream planners can separate impenetrable walls/pillars from penetrable vegetation/foliage and free space.
+- **Retains Fast Sensor-Frame Queries:** Still supports 2-pass ray CDF / likelihood evaluation for PLiNK-style LiDAR pose registration and active visibility planning, without PLiNK's expensive dense coarse-to-fine ray marching (10–50× faster training & inference).
+- **Important Caveats to Address in Paper / Robotics Stack:**
+  1. **Calibration (`hazard` vs. `softmax`):** `--cdf-mode hazard` directly yields physical extinction $\lambda(\mathbf{x}) \ge 0\,[\text{m}^{-1}]$ (`softplus`), whereas `softmax` logits are relative to the fixed `0.0` escape bin and shift upward on solid walls (`+5` to `+11`).
+  2. **Epistemic Uncertainty (Observed vs. Unobserved):** Direct 3D Marching Cubes immediately exposes unsupervised values in sensor blind cones and occlusion shadows behind pillars. Pairing the hash grid with a lightweight 3D ray-visitation/observation mask separates *known-empty* from *unobserved* space for safe motion planning.

@@ -14,7 +14,7 @@ Produces:
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 
@@ -161,6 +161,203 @@ def load_scene_from_config(config_path: Path) -> Tuple[Scene, LidarProjectionMod
     return scene, sensor, cfg
 
 
+def generate_dataset(
+    out_dir: Union[str, Path] = "data",
+    num_poses: int = 48,
+    orbit_radius: float = 0.5,
+    orbit_height: float = 1.4,
+    num_detectors: int = 32,
+    num_azimuth: int = 180,
+    elev_min: float = -25.0,
+    elev_max: float = 15.0,
+    max_range: float = 30.0,
+    seed: int = 42,
+    save: bool = True,
+) -> Dict[str, Any]:
+    """Generates multi-view synthetic LiDAR scans, optionally saving them to disk."""
+    out_path = Path(out_dir)
+    scans_dir = out_path / "scans"
+    if save:
+        scans_dir.mkdir(parents=True, exist_ok=True)
+
+    scene = build_default_room_scene()
+    sensor = LidarProjectionModel(
+        elevation_min=elev_min,
+        elevation_max=elev_max,
+        num_detectors=num_detectors,
+        num_azimuth=num_azimuth,
+        max_range=max_range,
+    )
+    positions, rotations = generate_orbit_poses(
+        num_poses=num_poses,
+        radius=orbit_radius,
+        height=orbit_height,
+    )
+
+    dest_msg = f" -> {out_path.resolve()}" if save else " (in-memory)"
+    print(f"Generating {num_poses} scans ({sensor.total_rays:,} rays/scan){dest_msg}")
+
+    all_rays_o = []
+    all_rays_d = []
+    all_hit_ranges = []
+    all_hit_masks = []
+    all_pose_indices = []
+
+    for i in range(num_poses):
+        pc = generate_point_cloud(
+            sensor=sensor,
+            scene=scene,
+            sensor_position=positions[i],
+            sensor_rotation=rotations[i],
+            method="sample",
+            return_placement="volume",
+            return_misses=True,
+            random_seed=seed + i,
+        )
+
+        rays_o = pc.rays_o.astype(np.float32)
+        rays_d = pc.ray_directions.astype(np.float32)
+        hit_ranges = pc.ranges.astype(np.float32)
+        hit_masks = (pc.probabilities > 0.0).astype(np.float32)
+
+        if save:
+            np.savez_compressed(
+                scans_dir / f"scan_{i:03d}.npz",
+                rays_o=rays_o,
+                rays_d=rays_d,
+                hit_ranges=hit_ranges,
+                hit_masks=hit_masks,
+                sensor_position=positions[i].astype(np.float32),
+                sensor_rotation=rotations[i].astype(np.float32),
+            )
+
+        all_rays_o.append(rays_o)
+        all_rays_d.append(rays_d)
+        all_hit_ranges.append(hit_ranges)
+        all_hit_masks.append(hit_masks)
+        all_pose_indices.append(np.full(len(rays_o), i, dtype=np.int32))
+
+    rays_o_cat = np.concatenate(all_rays_o, axis=0)
+    rays_d_cat = np.concatenate(all_rays_d, axis=0)
+    hit_ranges_cat = np.concatenate(all_hit_ranges, axis=0)
+    hit_masks_cat = np.concatenate(all_hit_masks, axis=0)
+    pose_idx_cat = np.concatenate(all_pose_indices, axis=0)
+    positions_f32 = positions.astype(np.float32)
+    rotations_f32 = rotations.astype(np.float32)
+
+    valid_hits = hit_masks_cat > 0.0
+    max_hit = float(hit_ranges_cat[valid_hits].max()) if np.any(valid_hits) else 0.0
+
+    config = {
+        "num_poses": num_poses,
+        "orbit_radius": orbit_radius,
+        "orbit_height": orbit_height,
+        "total_rays": int(len(rays_o_cat)),
+        "hit_rate": float(valid_hits.mean()),
+        "max_hit_range": max_hit,
+        "seed": seed,
+        "sensor": {
+            "elevation_min": sensor.elevation_min_deg,
+            "elevation_max": sensor.elevation_max_deg,
+            "num_detectors": sensor.num_detectors,
+            "num_azimuth": sensor.num_azimuth,
+            "azimuth_min": sensor.azimuth_min_deg,
+            "azimuth_max": sensor.azimuth_max_deg,
+            "min_range": sensor.min_range,
+            "max_range": sensor.max_range,
+        },
+        "scene_objects": serialize_scene(scene),
+    }
+
+    if save:
+        consolidated_path = out_path / "training_scans.npz"
+        np.savez(
+            consolidated_path,
+            rays_o=rays_o_cat,
+            rays_d=rays_d_cat,
+            hit_ranges=hit_ranges_cat,
+            hit_masks=hit_masks_cat,
+            pose_indices=pose_idx_cat,
+            sensor_positions=positions_f32,
+            sensor_rotations=rotations_f32,
+        )
+        config_path = out_path / "scene_config.json"
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+        print(
+            f"Done! Saved {len(rays_o_cat):,} rays ({valid_hits.mean() * 100:.1f}% hits, "
+            f"max hit range {max_hit:.2f}m)\n"
+            f"  - Per-pose scans: {scans_dir} ({num_poses} files)\n"
+            f"  - Consolidated:   {consolidated_path}\n"
+            f"  - Scene config:   {config_path}"
+        )
+    else:
+        print(
+            f"Done! Generated {len(rays_o_cat):,} rays ({valid_hits.mean() * 100:.1f}% hits, "
+            f"max hit range {max_hit:.2f}m)"
+        )
+
+    return {
+        "scene": scene,
+        "sensor": sensor,
+        "rays_o": rays_o_cat,
+        "rays_d": rays_d_cat,
+        "hit_ranges": hit_ranges_cat,
+        "hit_masks": hit_masks_cat,
+        "pose_indices": pose_idx_cat,
+        "positions": positions_f32,
+        "rotations": rotations_f32,
+        "config": config,
+    }
+
+
+def load_training_dataset(data_dir: Union[str, Path] = "data") -> Dict[str, Any]:
+    """Loads consolidated scans, poses, Scene, and LidarProjectionModel from data_dir."""
+    data_path = Path(data_dir)
+    consolidated_path = data_path / "training_scans.npz"
+    config_path = data_path / "scene_config.json"
+
+    if not consolidated_path.exists():
+        raise FileNotFoundError(
+            f"Missing '{consolidated_path}'. Run generate_training_data.py first."
+        )
+
+    with np.load(consolidated_path) as data:
+        rays_o = data["rays_o"].astype(np.float32)
+        rays_d = data["rays_d"].astype(np.float32)
+        hit_ranges = data["hit_ranges"].astype(np.float32)
+        hit_masks = data["hit_masks"].astype(np.float32)
+        pose_indices = data["pose_indices"].astype(np.int32) if "pose_indices" in data else None
+        positions = data["sensor_positions"].astype(np.float32) if "sensor_positions" in data else None
+        rotations = data["sensor_rotations"].astype(np.float32) if "sensor_rotations" in data else None
+
+    if config_path.exists():
+        scene, sensor, config = load_scene_from_config(config_path)
+    else:
+        scene = build_default_room_scene()
+        sensor = LidarProjectionModel(
+            elevation_min=-25.0,
+            elevation_max=15.0,
+            num_detectors=32,
+            num_azimuth=180,
+            max_range=30.0,
+        )
+        config = {}
+
+    return {
+        "scene": scene,
+        "sensor": sensor,
+        "rays_o": rays_o,
+        "rays_d": rays_d,
+        "hit_ranges": hit_ranges,
+        "hit_masks": hit_masks,
+        "pose_indices": pose_indices,
+        "positions": positions,
+        "rotations": rotations,
+        "config": config,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate synthetic multi-view LiDAR training scans into ./data/"
@@ -180,115 +377,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    out_dir = Path(args.out_dir)
-    scans_dir = out_dir / "scans"
-    scans_dir.mkdir(parents=True, exist_ok=True)
-
-    scene = build_default_room_scene()
-    sensor = LidarProjectionModel(
-        elevation_min=args.elev_min,
-        elevation_max=args.elev_max,
+    generate_dataset(
+        out_dir=args.out_dir,
+        num_poses=args.num_poses,
+        orbit_radius=args.orbit_radius,
+        orbit_height=args.orbit_height,
         num_detectors=args.num_detectors,
         num_azimuth=args.num_azimuth,
+        elev_min=args.elev_min,
+        elev_max=args.elev_max,
         max_range=args.max_range,
-    )
-    positions, rotations = generate_orbit_poses(
-        num_poses=args.num_poses,
-        radius=args.orbit_radius,
-        height=args.orbit_height,
-    )
-
-    print(f"Generating {args.num_poses} scans ({sensor.total_rays:,} rays/scan) -> {out_dir.resolve()}")
-
-    all_rays_o = []
-    all_rays_d = []
-    all_hit_ranges = []
-    all_hit_masks = []
-    all_pose_indices = []
-
-    for i in range(args.num_poses):
-        pc = generate_point_cloud(
-            sensor=sensor,
-            scene=scene,
-            sensor_position=positions[i],
-            sensor_rotation=rotations[i],
-            method="sample",
-            return_placement="volume",
-            return_misses=True,
-            random_seed=args.seed + i,
-        )
-
-        rays_o = pc.rays_o.astype(np.float32)
-        rays_d = pc.ray_directions.astype(np.float32)
-        hit_ranges = pc.ranges.astype(np.float32)
-        hit_masks = (pc.probabilities > 0.0).astype(np.float32)
-
-        np.savez_compressed(
-            scans_dir / f"scan_{i:03d}.npz",
-            rays_o=rays_o,
-            rays_d=rays_d,
-            hit_ranges=hit_ranges,
-            hit_masks=hit_masks,
-            sensor_position=positions[i].astype(np.float32),
-            sensor_rotation=rotations[i].astype(np.float32),
-        )
-
-        all_rays_o.append(rays_o)
-        all_rays_d.append(rays_d)
-        all_hit_ranges.append(hit_ranges)
-        all_hit_masks.append(hit_masks)
-        all_pose_indices.append(np.full(len(rays_o), i, dtype=np.int32))
-
-    rays_o_cat = np.concatenate(all_rays_o, axis=0)
-    rays_d_cat = np.concatenate(all_rays_d, axis=0)
-    hit_ranges_cat = np.concatenate(all_hit_ranges, axis=0)
-    hit_masks_cat = np.concatenate(all_hit_masks, axis=0)
-    pose_idx_cat = np.concatenate(all_pose_indices, axis=0)
-
-    consolidated_path = out_dir / "training_scans.npz"
-    np.savez(
-        consolidated_path,
-        rays_o=rays_o_cat,
-        rays_d=rays_d_cat,
-        hit_ranges=hit_ranges_cat,
-        hit_masks=hit_masks_cat,
-        pose_indices=pose_idx_cat,
-        sensor_positions=positions.astype(np.float32),
-        sensor_rotations=rotations.astype(np.float32),
-    )
-
-    valid_hits = hit_masks_cat > 0.0
-    max_hit = float(hit_ranges_cat[valid_hits].max()) if np.any(valid_hits) else 0.0
-
-    config = {
-        "num_poses": args.num_poses,
-        "orbit_radius": args.orbit_radius,
-        "orbit_height": args.orbit_height,
-        "total_rays": int(len(rays_o_cat)),
-        "hit_rate": float(valid_hits.mean()),
-        "max_hit_range": max_hit,
-        "seed": args.seed,
-        "sensor": {
-            "elevation_min": sensor.elevation_min_deg,
-            "elevation_max": sensor.elevation_max_deg,
-            "num_detectors": sensor.num_detectors,
-            "num_azimuth": sensor.num_azimuth,
-            "azimuth_min": sensor.azimuth_min_deg,
-            "azimuth_max": sensor.azimuth_max_deg,
-            "min_range": sensor.min_range,
-            "max_range": sensor.max_range,
-        },
-        "scene_objects": serialize_scene(scene),
-    }
-    config_path = out_dir / "scene_config.json"
-    config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-
-    print(
-        f"Done! Saved {len(rays_o_cat):,} rays ({valid_hits.mean() * 100:.1f}% hits, "
-        f"max hit range {max_hit:.2f}m)\n"
-        f"  - Per-pose scans: {scans_dir} ({args.num_poses} files)\n"
-        f"  - Consolidated:   {consolidated_path}\n"
-        f"  - Scene config:   {config_path}"
+        seed=args.seed,
+        save=True,
     )
 
 

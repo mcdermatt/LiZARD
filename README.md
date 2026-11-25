@@ -164,6 +164,21 @@ A second, self-contained Instant-NGP-style implementation (`HashSCKNetwork` + `H
 - **Fused Triton 3D Multi-Resolution Hash Grid (`HashGrid3D`):** Moves scene capacity into a 12-level 3D spatial hash table (`~6.3 MB` at `log2_hashmap_size=16`, `n_features=2`), shrinking the per-knot decoder to `hidden_dim=64` (~36k MLP params). Computes exact forward lookups and backward gradients for **both** hash table entries (`dL/dtable`) and 3D coordinates (`dL/dx`) in fused Triton kernels, with automatic fallback to `tinycudann` (if installed) or pure PyTorch.
 - **Architectural Refinements:** Uses origin-invariant Plücker ray features $(\mathbf{d}, \mathbf{m})$, evaluates the CDF head at **shifted interval midpoints** (with optional pure-3D readout `local_cdf=True` and $\log(\Delta s_k)$ width bias in softmax mode), grounds `ray_drop_head` in pooled 3D midpoint features, and adds sky empty-space carving (`lambda_sky_cdf`) with a zero-sync GPU training loop (`train_hash_sck_model`).
 
+### Unified Map & Ray Queries for Robotics: Free Global Volumetric Map + Fast Ray Queries (Paper Notes)
+
+Because `HashSCKNetwork` (`local_cdf=True`) decouples **Stage A ("where to look" — ray-conditioned knot placement)** from **Stage B ("what is there" — purely 3D-local `hash_grid(x) -> cdf_mlp -> cdf_out`)**, a single trained model provides **two complementary representations out of the box**:
+
+1. **Direct Global Volumetric Map (No LiDAR Projection Model or Viewpoint Stitching Needed):**
+   - Query any 3D coordinate $\mathbf{x} \in \mathbb{R}^3$ directly in $O(1)$ without casting rays, synthesizing novel LiDAR scans, or fusing clouds into an OctoMap/TSDF.
+   - **Motion Planning & Collision Checking:** Batch-evaluate hazard along candidate robot trajectories or swept footprints in ~1 ms on GPU.
+   - **Continuous Soft-Obstacle Traversability:** Distinguishes solid walls ($\lambda \gg 10$), dense trunks/pillars ($\lambda \approx 1$), passable porous foliage/grass ($\lambda \approx 0.1$), and open air ($\lambda \approx 0$).
+   - **Instant Global Meshing / Costmaps:** Evaluate the 3D field on a voxel grid and run Marching Cubes (`vtkFlyingEdges3D` in `train_live.py`) in ~20–30 ms for a full view-independent 3D scene mesh.
+2. **Fast Sensor-Frame Probabilistic Ray Queries (When a Sensor Model *Is* Needed):**
+   - Retains 2-pass self-conditioned ray CDF evaluation (no dense 100+ sample coarse-to-fine marching like PLiNK/NeRF) for **LiDAR localization / pose registration**, **scan likelihood scoring**, and **active exploration / visibility prediction**.
+3. **Practical Notes for Downstream Robotics Deployment:**
+   - **Calibrated Physical Units:** Use `--cdf-mode hazard` when querying $\lambda(\mathbf{x})$ directly as physical extinction ($\text{m}^{-1}$, so $1 - e^{-\lambda(\mathbf{x})\Delta s}$ is calibrated return/collision probability); in `softmax` mode, raw logits are unnormalized log-ratios relative to the escape bin and require rescaling for visualization/thresholding.
+   - **Observed Free vs. Unobserved Space:** Neural hash grids have an unsupervised prior in blind cones and occlusion shadows; pairing the hash grid with a lightweight 3D visitation/ray-count bitmask separates *known-free* (safe) from *unobserved* (explore cautiously).
+
 ### Synthetic Data Pipeline (`synthetic_data_generation_utils.py`)
 
 A modular simulation utility is implemented in `synthetic_data_generation_utils.py` to evaluate SCK:
