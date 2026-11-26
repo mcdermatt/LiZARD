@@ -36,7 +36,7 @@ import torch
 import torch.nn.functional as F
 
 from generate_training_data import load_scene_from_config
-from hash_sck_model import HashSCKNetwork, compute_hash_sck_loss
+from hash_sck_model import HashSCKNetwork, compute_3d_curvature_loss, compute_hash_sck_loss
 from sck_model import (
     DeeperSCKNetwork,
     GPURayBatcher,
@@ -169,6 +169,10 @@ VIEWER_HTML = r"""<!DOCTYPE html>
         <input id="chk-mask-unobs" type="checkbox" checked style="accent-color: #58a6ff; width: 15px; height: 15px;" />
       </div>
       <div class="row">
+        <label for="chk-mesh-alpha">Density alpha</label>
+        <input id="chk-mesh-alpha" type="checkbox" checked style="accent-color: #58a6ff; width: 15px; height: 15px;" />
+      </div>
+      <div class="row">
         <label for="sel-mres">MC Grid res</label>
         <select id="sel-mres">
           <option value="64">64&sup3; (Fast)</option>
@@ -196,6 +200,7 @@ VIEWER_HTML = r"""<!DOCTYPE html>
         <option value="z">Height Z (m)</option>
         <option value="prob">Return Prob (Total)</option>
         <option value="local_prob">Local Return Prob</option>
+        <option value="density">3D Density (MC)</option>
         <option value="normal">Surface Normal</option>
         <option value="clump">Clump ID (MC)</option>
       </select>
@@ -410,21 +415,39 @@ let sphereInstMesh = null;
 let patchInstMesh = null;
 let instCapacity = 0;
 
-// Live 3D Marching Cubes mesh (extracted directly from HashSCKNetwork's 3D field)
-const mcGeom = new THREE.BufferGeometry();
-const mcMat = new THREE.MeshStandardMaterial({
+// Live 3D Marching Cubes meshes (split into opaque solid + translucent porous layers
+// when Density Alpha is enabled, avoiding WebGL depth-sorting artifacts on solid walls)
+const mcSolidGeom = new THREE.BufferGeometry();
+const mcSolidMat = new THREE.MeshStandardMaterial({
   color: 0xffffff,
   vertexColors: true,
   roughness: 0.45,
   metalness: 0.08,
   side: THREE.DoubleSide,
 });
-const mcMesh = new THREE.Mesh(mcGeom, mcMat);
-mcMesh.frustumCulled = false;
-mcMesh.visible = false;
-scene.add(mcMesh);
+const mcSolidMesh = new THREE.Mesh(mcSolidGeom, mcSolidMat);
+mcSolidMesh.frustumCulled = false;
+mcSolidMesh.visible = false;
+scene.add(mcSolidMesh);
 
-let lastMeshVerts = null, lastMeshNorms = null, lastMeshIdx = null, lastMeshRegions = null;
+const mcPorousGeom = new THREE.BufferGeometry();
+const mcPorousMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff,
+  vertexColors: true,
+  transparent: true,
+  depthWrite: false,
+  roughness: 0.35,
+  metalness: 0.05,
+  side: THREE.DoubleSide,
+});
+const mcPorousMesh = new THREE.Mesh(mcPorousGeom, mcPorousMat);
+mcPorousMesh.frustumCulled = false;
+mcPorousMesh.visible = false;
+mcPorousMesh.renderOrder = 2;
+scene.add(mcPorousMesh);
+
+let lastMeshVerts = null, lastMeshNorms = null, lastMeshIdx = null, lastMeshRegions = null, lastMeshDensities = null;
+let meshDensityAlpha = true;
 let lastMeshVersion = -1;
 let meshTrisCount = 0;
 let meshMsLast = 0;
@@ -534,6 +557,7 @@ function computePointColors() {
   if (colorMode === 'z') { vmin = 0.0; vmax = 3.0; label = 'Height Z (m)'; }
   else if (colorMode === 'prob') { vmin = 0.0; vmax = 1.0; label = 'Return Prob (Total)'; }
   else if (colorMode === 'local_prob') { vmin = 0.0; vmax = 1.0; label = 'Local Return Prob (±0.25m)'; }
+  else if (colorMode === 'density') { vmin = 0.0; vmax = 1.0; label = '3D Field Density'; }
   else if (colorMode === 'normal') { vmin = -1.0; vmax = 1.0; label = 'Normal XYZ -> RGB'; }
 
   document.getElementById('cbar-min').textContent = vmin.toFixed(1);
@@ -553,7 +577,7 @@ function computePointColors() {
   for (let i = 0; i < n; i++) {
     const val = colorMode === 'z' ? lastPts[i * 3 + 2]
               : colorMode === 'prob' ? lastProbs[i]
-              : colorMode === 'local_prob' ? (lastLocalProbs ? lastLocalProbs[i] : lastProbs[i])
+              : (colorMode === 'local_prob' || colorMode === 'density') ? (lastLocalProbs ? lastLocalProbs[i] : lastProbs[i])
               : lastRanges[i];
     const idx = Math.max(0, Math.min(255, Math.round((val - vmin) * inv * 255)));
     colors[i * 3 + 0] = PLASMA_LUT[idx * 3 + 0];
@@ -570,28 +594,53 @@ const CLUMP_PALETTE = [
 ];
 
 function rebuildMeshColors() {
-  if (!lastMeshVerts || lastMeshVerts.length === 0) return;
+  if (!lastMeshVerts || lastMeshVerts.length === 0 || !lastMeshIdx) return;
   const n = lastMeshVerts.length / 3;
-  const colors = new Float32Array(n * 3);
+  const useAlpha = meshDensityAlpha && lastMeshDensities && lastMeshDensities.length === n;
+  const stride = useAlpha ? 4 : 3;
+  const colors = new Float32Array(n * stride);
+
+  // Update colorbar when in pure mesh mode so density / z / range labels stay accurate
+  if (geomMode === 'mesh') {
+    let vmin = 0.0, vmax = currentSMax, label = 'Range (m)';
+    if (colorMode === 'z') { vmin = 0.0; vmax = 3.0; label = 'Height Z (m)'; }
+    else if (colorMode === 'density' || colorMode === 'prob' || colorMode === 'local_prob') {
+      vmin = 0.0; vmax = 1.0; label = '3D Field Density';
+    } else if (colorMode === 'normal') { vmin = -1.0; vmax = 1.0; label = 'Normal XYZ -> RGB'; }
+    else if (colorMode === 'clump') { vmin = 0.0; vmax = 1.0; label = 'Clump ID (MC)'; }
+    document.getElementById('cbar-min').textContent = vmin.toFixed(1);
+    document.getElementById('cbar-mid').textContent = label;
+    document.getElementById('cbar-max').textContent = vmax.toFixed(1);
+  }
+
   if (colorMode === 'clump' && lastMeshRegions) {
     for (let i = 0; i < n; i++) {
       const c = CLUMP_PALETTE[lastMeshRegions[i] % CLUMP_PALETTE.length];
-      colors[i * 3 + 0] = c[0];
-      colors[i * 3 + 1] = c[1];
-      colors[i * 3 + 2] = c[2];
+      colors[i * stride + 0] = c[0];
+      colors[i * stride + 1] = c[1];
+      colors[i * stride + 2] = c[2];
     }
   } else if (colorMode === 'normal' && lastMeshNorms) {
     for (let i = 0; i < n; i++) {
-      colors[i * 3 + 0] = Math.max(0, Math.min(1, lastMeshNorms[i * 3 + 0] * 0.5 + 0.5));
-      colors[i * 3 + 1] = Math.max(0, Math.min(1, lastMeshNorms[i * 3 + 1] * 0.5 + 0.5));
-      colors[i * 3 + 2] = Math.max(0, Math.min(1, lastMeshNorms[i * 3 + 2] * 0.5 + 0.5));
+      colors[i * stride + 0] = Math.max(0, Math.min(1, lastMeshNorms[i * 3 + 0] * 0.5 + 0.5));
+      colors[i * stride + 1] = Math.max(0, Math.min(1, lastMeshNorms[i * 3 + 1] * 0.5 + 0.5));
+      colors[i * stride + 2] = Math.max(0, Math.min(1, lastMeshNorms[i * 3 + 2] * 0.5 + 0.5));
     }
-  } else if (colorMode === 'prob' || colorMode === 'local_prob') {
-    // Neutral smooth ceramic clay so Marching Cubes lighting & contours shine
+  } else if ((colorMode === 'density' || colorMode === 'prob' || colorMode === 'local_prob') && lastMeshDensities) {
+    // Map interior-probed 3D field density [0, 1] through Plasma LUT
+    // (deep violet = porous foliage, magenta = glass windows, bright yellow/orange = solid walls/trunks)
     for (let i = 0; i < n; i++) {
-      colors[i * 3 + 0] = 0.78;
-      colors[i * 3 + 1] = 0.84;
-      colors[i * 3 + 2] = 0.92;
+      const d = lastMeshDensities[i];
+      const idx = Math.max(0, Math.min(255, Math.round(d * 255)));
+      colors[i * stride + 0] = PLASMA_LUT[idx * 3 + 0];
+      colors[i * stride + 1] = PLASMA_LUT[idx * 3 + 1];
+      colors[i * stride + 2] = PLASMA_LUT[idx * 3 + 2];
+    }
+  } else if (colorMode === 'prob' || colorMode === 'local_prob' || colorMode === 'density') {
+    for (let i = 0; i < n; i++) {
+      colors[i * stride + 0] = 0.78;
+      colors[i * stride + 1] = 0.84;
+      colors[i * stride + 2] = 0.92;
     }
   } else {
     const vmin = 0.0;
@@ -602,12 +651,51 @@ function rebuildMeshColors() {
       const vx = lastMeshVerts[i * 3], vy = lastMeshVerts[i * 3 + 1], vz = lastMeshVerts[i * 3 + 2];
       const val = colorMode === 'z' ? vz : Math.hypot(vx - sx, vy - sy, vz - sz);
       const idx = Math.max(0, Math.min(255, Math.round((val - vmin) * inv * 255)));
-      colors[i * 3 + 0] = PLASMA_LUT[idx * 3 + 0];
-      colors[i * 3 + 1] = PLASMA_LUT[idx * 3 + 1];
-      colors[i * 3 + 2] = PLASMA_LUT[idx * 3 + 2];
+      colors[i * stride + 0] = PLASMA_LUT[idx * 3 + 0];
+      colors[i * stride + 1] = PLASMA_LUT[idx * 3 + 1];
+      colors[i * stride + 2] = PLASMA_LUT[idx * 3 + 2];
     }
   }
-  mcGeom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  const SOLID_THRESH = 0.72;
+  if (useAlpha) {
+    for (let i = 0; i < n; i++) {
+      const d = lastMeshDensities[i];
+      // Solid walls/trunks (>= 0.72) -> opaque 1.0; porous foliage/glass -> smooth alpha [0.16, 0.82]
+      const a = d >= SOLID_THRESH
+        ? 1.0
+        : Math.max(0.16, Math.min(0.82, 0.16 + 0.66 * ((d - 0.25) / (SOLID_THRESH - 0.25))));
+      colors[i * 4 + 3] = a;
+    }
+
+    // Split triangles cleanly into opaque solid layer + translucent porous layer
+    const nt = lastMeshIdx.length / 3;
+    const solidTmp = new Uint32Array(lastMeshIdx.length);
+    const porousTmp = new Uint32Array(lastMeshIdx.length);
+    let ns = 0, np = 0;
+    for (let t = 0; t < nt; t++) {
+      const i0 = lastMeshIdx[t * 3 + 0];
+      const i1 = lastMeshIdx[t * 3 + 1];
+      const i2 = lastMeshIdx[t * 3 + 2];
+      const dAvg = (lastMeshDensities[i0] + lastMeshDensities[i1] + lastMeshDensities[i2]) * (1.0 / 3.0);
+      if (dAvg >= SOLID_THRESH) {
+        solidTmp[ns++] = i0; solidTmp[ns++] = i1; solidTmp[ns++] = i2;
+      } else {
+        porousTmp[np++] = i0; porousTmp[np++] = i1; porousTmp[np++] = i2;
+      }
+    }
+    const colorAttr = new THREE.BufferAttribute(colors, 4);
+    mcSolidGeom.setAttribute('color', colorAttr);
+    mcPorousGeom.setAttribute('color', colorAttr);
+    mcSolidGeom.setIndex(new THREE.BufferAttribute(solidTmp.subarray(0, ns), 1));
+    mcPorousGeom.setIndex(new THREE.BufferAttribute(porousTmp.subarray(0, np), 1));
+  } else {
+    const colorAttr = new THREE.BufferAttribute(colors, 3);
+    mcSolidGeom.setAttribute('color', colorAttr);
+    mcSolidGeom.setIndex(new THREE.BufferAttribute(lastMeshIdx, 1));
+    mcPorousGeom.setIndex(new THREE.BufferAttribute(new Uint32Array(0), 1));
+  }
+  syncMeshControlsUI();
 }
 
 function isMeshMode() {
@@ -617,7 +705,9 @@ function isMeshMode() {
 function syncMeshControlsUI() {
   const show = isMeshMode();
   document.getElementById('mesh-controls').style.display = show ? 'flex' : 'none';
-  mcMesh.visible = show && lastMeshVerts !== null && lastMeshVerts.length > 0;
+  const hasVerts = show && lastMeshVerts !== null && lastMeshVerts.length > 0;
+  mcSolidMesh.visible = hasVerts && mcSolidGeom.index !== null && mcSolidGeom.index.count > 0;
+  mcPorousMesh.visible = hasVerts && meshDensityAlpha && mcPorousGeom.index !== null && mcPorousGeom.index.count > 0;
 }
 
 function rebuildCloudVisual() {
@@ -917,7 +1007,8 @@ async function pollMesh() {
         const verts = new Float32Array(buf, offset, nv * 3);
         const norms = new Float32Array(buf, offset + nv * 12, nv * 3);
         const regions = new Uint32Array(buf, offset + nv * 24, nv);
-        const indices = new Uint32Array(buf, offset + nv * 28, nt * 3);
+        const densities = new Float32Array(buf, offset + nv * 28, nv);
+        const indices = new Uint32Array(buf, offset + nv * 32, nt * 3);
 
         lastMeshVersion = meta.version;
         meshTrisCount = nt;
@@ -925,13 +1016,18 @@ async function pollMesh() {
         lastMeshVerts = verts;
         lastMeshNorms = norms;
         lastMeshRegions = regions;
+        lastMeshDensities = densities;
         lastMeshIdx = indices;
 
-        mcGeom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
-        mcGeom.setAttribute('normal', new THREE.BufferAttribute(norms, 3));
-        mcGeom.setIndex(new THREE.BufferAttribute(indices, 1));
+        const posAttr = new THREE.BufferAttribute(verts, 3);
+        const normAttr = new THREE.BufferAttribute(norms, 3);
+        mcSolidGeom.setAttribute('position', posAttr);
+        mcSolidGeom.setAttribute('normal', normAttr);
+        mcPorousGeom.setAttribute('position', posAttr);
+        mcPorousGeom.setAttribute('normal', normAttr);
         rebuildMeshColors();
-        mcGeom.computeBoundingSphere();
+        mcSolidGeom.computeBoundingSphere();
+        mcPorousGeom.computeBoundingSphere();
         syncMeshControlsUI();
 
         if (geomMode === 'mesh') {
@@ -1061,6 +1157,10 @@ document.getElementById('btn-unobs').addEventListener('click', toggleUnobs);
 document.getElementById('rng-iso').addEventListener('input', () => pushMeshSettings(false));
 document.getElementById('rng-iso-clump').addEventListener('input', () => pushMeshSettings(false));
 document.getElementById('chk-mask-unobs').addEventListener('change', () => pushMeshSettings(true));
+document.getElementById('chk-mesh-alpha').addEventListener('change', (e) => {
+  meshDensityAlpha = Boolean(e.target.checked);
+  rebuildMeshColors();
+});
 document.getElementById('sel-mres').addEventListener('change', () => pushMeshSettings(true));
 
 document.getElementById('sel-geom').addEventListener('change', (e) => {
@@ -1471,6 +1571,49 @@ def _eval_hash_points_gpu(
         else:
             vals[i:j] = 1.0 - torch.exp(-F.softplus(raw))
     return vals
+
+
+@torch.no_grad()
+def eval_mesh_vertex_densities_gpu(
+    model: torch.nn.Module,
+    verts: np.ndarray,
+    norms: np.ndarray,
+    spacing: Tuple[float, float, float],
+    device: Optional[torch.device] = None,
+) -> np.ndarray:
+    """Evaluates per-vertex interior solidity in (0, 1) for density color/alpha coding.
+
+    Since every Marching Cubes vertex sits on the iso-surface itself, probing symmetrically
+    at [v, v - s*n, v + s*n] and taking the max cleanly separates solid walls/trunks (~0.85-0.98)
+    from semi-transparent windows (~0.55-0.75) and porous foliage (~0.30-0.55), independent
+    of normal orientation.
+    """
+    n = len(verts)
+    if n == 0:
+        return np.empty((0,), dtype=np.float32)
+    orig = getattr(model, "_orig_mod", model)
+    if not isinstance(orig, HashSCKNetwork):
+        return np.ones((n,), dtype=np.float32)
+    if device is None:
+        device = next(orig.parameters()).device
+
+    was_training = orig.training
+    orig.eval()
+
+    v_t = torch.from_numpy(verts).to(device=device, dtype=torch.float32)
+    n_t = torch.from_numpy(norms).to(device=device, dtype=torch.float32)
+    n_len = torch.linalg.norm(n_t, dim=-1, keepdim=True)
+    n_unit = torch.where(n_len > 1e-6, n_t / torch.clamp(n_len, min=1e-6), torch.zeros_like(n_t))
+
+    step = min(max(spacing) * 1.25, 0.14)
+    pts_probe = torch.cat([v_t, v_t - step * n_unit, v_t + step * n_unit], dim=0)
+    vals = _eval_hash_points_gpu(orig, pts_probe, chunk_size=65536).view(3, n)
+    peak_density = vals.max(dim=0).values
+
+    if was_training:
+        orig.train()
+
+    return peak_density.cpu().numpy().astype(np.float32, copy=False)
 
 
 @torch.no_grad()
@@ -2384,6 +2527,7 @@ class LiveServerState:
         verts: np.ndarray,
         norms: np.ndarray,
         regions: np.ndarray,
+        densities: np.ndarray,
         indices: np.ndarray,
         mesh_ms: float,
         iso_level: float,
@@ -2405,7 +2549,12 @@ class LiveServerState:
             pad = (-len(meta_bytes)) % 4
             header = struct.pack("<I", len(meta_bytes)) + meta_bytes + (b"\x00" * pad)
             self.latest_mesh_blob = (
-                header + verts.tobytes() + norms.tobytes() + regions.tobytes() + indices.tobytes()
+                header
+                + verts.tobytes()
+                + norms.tobytes()
+                + regions.tobytes()
+                + densities.tobytes()
+                + indices.tobytes()
             )
 
     def get_mesh_if_newer(self, client_version: int) -> Optional[bytes]:
@@ -2642,6 +2791,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-fourier", type=float, default=5e-4, help="(Fourier model) Learning rate (default: 5e-4)")
     parser.add_argument("--lambda-raydrop", type=float, default=0.1, help="Ray-drop BCE loss weight (default: 0.1)")
     parser.add_argument("--lambda-sky-cdf", type=float, default=0.1, help="(Hash model) Sky empty-space carving weight (default: 0.1)")
+    parser.add_argument("--lambda-curv", type=float, default=0.05, help="(Hash model) 3D curvature (2nd-order Laplacian) smoothness weight (default: 0.05; 0 to disable)")
+    parser.add_argument("--curv-samples", type=int, default=1024, help="(Hash model) 3D points per batch for curvature loss (default: 1024)")
+    parser.add_argument("--no-coarse-to-fine", action="store_true", help="(Hash model) Disable progressive coarse-to-fine hash level masking")
+    parser.add_argument("--ctf-start-levels", type=int, default=4, help="(Hash model) Initial active coarse hash levels at Epoch 0 (default: 4)")
+    parser.add_argument("--ctf-end-frac", type=float, default=0.6, help="(Hash model) Training fraction at which all hash levels are fully unlocked (default: 0.6)")
     parser.add_argument("--origin-slide", action="store_true", help="Enable vectorized GPU origin-sliding augmentation")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (adds one-time JIT compile at Epoch 1, ~19%% faster after)")
 
@@ -2658,7 +2812,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-method", type=str, choices=["sample", "threshold"], default="sample", help="CDF point extraction mode (default: sample)")
     parser.add_argument("--threshold", type=float, default=0.5, help="CDF threshold when --render-method=threshold (default: 0.5)")
     parser.add_argument("--non-return-threshold", type=float, default=0.1, help="Prune ray if P(non-return) > threshold (default: 0.1)")
-    parser.add_argument("--color-by", type=str, choices=["range", "z", "probability", "local_prob", "normal", "clump"], default="range", help="Initial point color scalar (default: range)")
+    parser.add_argument("--color-by", type=str, choices=["range", "z", "probability", "local_prob", "density", "normal", "clump"], default="range", help="Initial point color scalar (default: range)")
     parser.add_argument("--point-style", type=str, choices=["points", "spheres", "patches", "mesh", "mesh+patches"], default="patches", help="Initial visual style (default: patches)")
     parser.add_argument("--mesh-iso", type=float, default=0.45, help="Initial Marching Cubes iso-level in (0, 1) (default: 0.45)")
     parser.add_argument("--clump-isolate", type=float, default=0.45, help="Difference-of-Gaussians clump isolation strength in [0, 1] (default: 0.45)")
@@ -2954,11 +3108,19 @@ def main() -> None:
                 cached_vol_info["spacing"],
                 iso_level=iso,
             )
+        densities = eval_mesh_vertex_densities_gpu(
+            model=model,
+            verts=verts,
+            norms=norms,
+            spacing=cached_vol_info["spacing"],
+            device=device,
+        )
         mesh_ms = (time.perf_counter() - t_m0) * 1000.0
         state.publish_mesh(
             verts=verts,
             norms=norms,
             regions=regions,
+            densities=densities,
             indices=indices,
             mesh_ms=mesh_ms,
             iso_level=iso,
@@ -3026,16 +3188,34 @@ def main() -> None:
         push_unobs(epoch_float)
 
     # 5. Train directly on the main thread at 100% native GPU speed
+    orig_model = getattr(model, "_orig_mod", model)
+    total_train_steps = max(1, args.epochs * steps_per_epoch)
+    ctf_steps = max(1.0, float(args.ctf_end_frac) * total_train_steps)
+    use_ctf = (args.model == "hash") and (not args.no_coarse_to_fine)
+    if args.model == "hash":
+        print(
+            f"3D Smoothness: coarse_to_fine={use_ctf} "
+            f"(lvls {args.ctf_start_levels}->{orig_model.hash_grid.n_levels} over {args.ctf_end_frac * 100:.0f}% epochs), "
+            f"lambda_curv={args.lambda_curv} ({args.curv_samples} pts/batch)",
+            flush=True,
+        )
+
     try:
         while not state.stop_event.is_set():
             optimizer, scheduler = make_optimizer_and_scheduler(model, args, device)
             global_step = 0
             last_loss = float("nan")
             last_rps = 0.0
+            active_lvls = float(orig_model.hash_grid.n_levels) if args.model == "hash" else 0.0
 
             with state.lock:
                 state.loss_history.clear()
             vis_grid.reset()
+            if args.model == "hash":
+                if use_ctf:
+                    active_lvls = orig_model.set_coarse_to_fine_progress(0.0, start_levels=args.ctf_start_levels)
+                else:
+                    orig_model.hash_grid.set_active_levels(orig_model.hash_grid.n_levels)
             cached_vol_info["mode"] = None
             cached_vol_info["v_smooth"] = None
             cached_vol_info["v_wide"] = None
@@ -3080,6 +3260,12 @@ def main() -> None:
                         restarted = True
                         break
 
+                    ctf_prog = min(1.0, global_step / ctf_steps)
+                    if use_ctf:
+                        active_lvls = orig_model.set_coarse_to_fine_progress(
+                            ctf_prog, start_levels=args.ctf_start_levels
+                        )
+
                     optimizer.zero_grad(set_to_none=True)
                     ray_o = batch["ray_o"]
                     ray_d = batch["ray_d"]
@@ -3109,6 +3295,19 @@ def main() -> None:
                             lambda_sky_cdf=args.lambda_sky_cdf,
                             s_max=args.s_max,
                         )
+                        if args.lambda_curv > 0.0:
+                            curv_eps = 0.12 + ctf_prog * (0.03 - 0.12)
+                            loss_curv = compute_3d_curvature_loss(
+                                model=orig_model,
+                                ray_o=ray_o,
+                                ray_d=ray_d,
+                                hit_range=hit_range,
+                                hit_mask=hit_mask,
+                                num_samples=args.curv_samples,
+                                eps=curv_eps,
+                                s_max=args.s_max,
+                            )
+                            loss = loss + args.lambda_curv * loss_curv
                     else:
                         loss, _ = compute_sck_loss(
                             round_outputs=round_outputs,
@@ -3159,9 +3358,10 @@ def main() -> None:
                 ep_rps = dataloader.N / max(ep_time, 1e-6)
                 last_loss = ep_loss
                 last_rps = ep_rps
+                lvl_str = f" | lvls {active_lvls:.1f}/{orig_model.hash_grid.n_levels}" if use_ctf else ""
                 print(
                     f"Epoch [{epoch + 1:02d}/{args.epochs:02d}] - "
-                    f"Loss: {ep_loss:.6f} | {ep_time:.2f}s ({ep_rps:,.0f} rays/s)",
+                    f"Loss: {ep_loss:.6f} | {ep_time:.2f}s ({ep_rps:,.0f} rays/s){lvl_str}",
                     flush=True,
                 )
 

@@ -340,6 +340,8 @@ class HashGrid3D(nn.Module):
             growth = 1.0
         resolutions = [int(round(base_resolution * (growth ** i))) for i in range(n_levels)]
         self.register_buffer("resolutions", torch.tensor(resolutions, dtype=torch.float32))
+        # Progressive coarse-to-fine level mask (all 1.0 = full resolution by default)
+        self.register_buffer("level_mask", torch.ones((1, self.out_dim), dtype=torch.float32))
 
         if backend == "auto":
             if HAS_TCNN:
@@ -387,6 +389,17 @@ class HashGrid3D(nn.Module):
             )
             self.register_buffer("level_idx", torch.arange(n_levels, dtype=torch.int64))
 
+    def set_active_levels(self, active_levels: float) -> None:
+        """Sets smooth per-level weights in-place for progressive coarse-to-fine training.
+
+        Levels l < floor(active_levels) receive weight 1.0, the transitional level ramps
+        smoothly from 0.0 to 1.0, and finer levels are masked to 0.0 (no torch.compile break).
+        """
+        with torch.no_grad():
+            lvls = torch.arange(self.n_levels, device=self.level_mask.device, dtype=torch.float32)
+            w = torch.clamp(float(active_levels) - lvls, 0.0, 1.0)
+            self.level_mask.copy_(w.repeat_interleave(self.n_features).unsqueeze(0))
+
     def reset_parameters(self) -> None:
         """Re-initializes hash table entries in-place (preserves torch.compile cache)."""
         with torch.no_grad():
@@ -395,6 +408,7 @@ class HashGrid3D(nn.Module):
             elif self.tcnn_enc is not None:
                 for p in self.tcnn_enc.parameters():
                     p.uniform_(-1e-4, 1e-4)
+            self.level_mask.fill_(1.0)
 
     def _forward_pytorch(self, x_norm: torch.Tensor) -> torch.Tensor:
         M = x_norm.shape[0]
@@ -434,6 +448,7 @@ class HashGrid3D(nn.Module):
         else:
             out = self._forward_pytorch(x_norm)
 
+        out = out * self.level_mask
         return out.reshape(*orig_shape, self.out_dim)
 
 
@@ -481,6 +496,14 @@ class HashSCKNetwork(nn.Module):
         max_resolution: HashGrid3D finest resolution (default 512).
         scene_bound: Half-extent of cubic 3D hash grid [-bound, +bound]^3 (default s_max).
         hash_backend: 'auto' (default), 'triton', 'tcnn', or 'pytorch'.
+        coarse_to_fine: Enable progressive coarse-to-fine hash level masking (default True).
+        ctf_start_levels: Initial coarsest hash levels active at Epoch 0 (default 4).
+        ctf_end_frac: Training fraction at which all hash levels unlock (default 0.6).
+        lambda_curv: 3D curvature (2nd-order Laplacian) smoothness loss weight (default 0.05).
+        curv_samples: 3D points per batch for curvature loss (default 1024).
+        curv_eps_start: Initial finite-difference step in meters for curvature loss (default 0.12).
+        curv_eps_end: Final finite-difference step in meters for curvature loss (default 0.03).
+        lambda_hash_l2: Fine-level-only L2 decay weight on hash tables (default 1e-3; 0 disables).
     """
 
     def __init__(
@@ -502,6 +525,15 @@ class HashSCKNetwork(nn.Module):
         max_resolution: int = 2048,            # [Fidelity] Finest grid resolution across 2*bound (voxel = 2*bound/max_res). Raise (1024-2048) with larger log2_hashmap_size for sharper thin edges.
         scene_bound: Optional[float] = None,  # [Fidelity] Half-extent of cubic 3D hash grid [-bound, +bound]^3 (default s_max). Free fidelity boost when tightened to actual scene AABB.
         hash_backend: str = "auto",           # [Speed, Hashmap] 'tcnn' (fastest + dense coarse levels, if installed) > 'triton' (fast fused CUDA, n_features=2) >> 'pytorch' (slow fallback).
+        # --- 3D Smoothness & Regularization ---
+        coarse_to_fine: bool = True,          # [Fidelity] Progressive coarse-to-fine hash masking: locks in smooth coarse walls/ground before fine levels unlock (~0% cost).
+        ctf_start_levels: int = 4,            # [Fidelity] Number of coarsest collision-free hash levels active at Epoch 0 when coarse_to_fine=True.
+        ctf_end_frac: float = 0.6,            # [Fidelity] Training fraction at which all hash levels finish unlocking (0.6 = full fine resolution for final 40% of training).
+        lambda_curv: float = 0.05,            # [Fidelity, Speed] 3D curvature (2nd-order Laplacian) smoothness weight; flattens bumpy ripples while preserving sharp planar walls (~2-5% cost; 0 disables).
+        curv_samples: int = 1024,             # [Fidelity, Speed] Random 3D points/batch for curvature loss (75% near hit surfaces, 25% along free-space ray interiors).
+        curv_eps_start: float = 0.12,         # [Fidelity] Initial finite-difference step size (m) for 3D curvature at Epoch 0 (smooths broad waves).
+        curv_eps_end: float = 0.03,           # [Fidelity] Final finite-difference step size (m) for 3D curvature once fine levels unlock (smooths cm-scale ripples).
+        lambda_hash_l2: float = 1e-3,         # [Fidelity] Fine-level-only L2 decay on hash tables (0 on coarse levels, linearly ramped to 1 on finest level). Kills collision speckles (~0% cost); too high (>1e-2) softens thin branches.
     ):
         super().__init__()
         self.num_knots = num_knots
@@ -512,7 +544,22 @@ class HashSCKNetwork(nn.Module):
         self.cdf_mode = cdf_mode
         self.local_cdf = local_cdf
         self.use_viewdir = use_viewdir
+        self.coarse_to_fine = bool(coarse_to_fine)
+        self.ctf_start_levels = int(ctf_start_levels)
+        self.ctf_end_frac = float(ctf_end_frac)
+        self.lambda_curv = float(lambda_curv)
+        self.curv_samples = int(curv_samples)
+        self.curv_eps_start = float(curv_eps_start)
+        self.curv_eps_end = float(curv_eps_end)
+        self.lambda_hash_l2 = float(lambda_hash_l2)
         bound = float(scene_bound) if scene_bound is not None else float(s_max)
+
+        # Per-level weights for fine-only L2 decay: 0 on coarse levels (< ctf_start_levels),
+        # ramping linearly to 1.0 on the finest level where hash collisions concentrate.
+        lvl_idx = torch.arange(n_levels, dtype=torch.float32)
+        denom = max(1.0, float(n_levels - self.ctf_start_levels))
+        fine_w = torch.clamp((lvl_idx - self.ctf_start_levels + 1.0) / denom, 0.0, 1.0)
+        self.register_buffer("fine_l2_weights", fine_w.view(n_levels, 1, 1))
 
         # 1. Shared Multi-Resolution 3D Spatial Hash Grid
         self.hash_grid = HashGrid3D(
@@ -621,6 +668,61 @@ class HashSCKNetwork(nn.Module):
             {"params": hash_params, "lr": lr_hash, "weight_decay": 0.0},
             {"params": mlp_params, "lr": lr_mlp, "weight_decay": weight_decay_mlp},
         ]
+
+    def set_coarse_to_fine_progress(self, progress: float, start_levels: Optional[int] = None) -> float:
+        """Updates progressive coarse-to-fine hash level mask in-place.
+
+        Args:
+            progress: Training progress in [0.0, 1.0] across the coarse-to-fine schedule.
+            start_levels: Number of coarsest hash levels active at progress=0.0
+                (defaults to self.ctf_start_levels).
+
+        Returns:
+            Current floating-point active level count.
+        """
+        p = max(0.0, min(1.0, float(progress)))
+        lo_val = self.ctf_start_levels if start_levels is None else int(start_levels)
+        lo = max(1, min(lo_val, self.hash_grid.n_levels))
+        active = lo + p * (self.hash_grid.n_levels - lo)
+        self.hash_grid.set_active_levels(active)
+        return active
+
+    def fine_hash_l2_loss(self) -> torch.Tensor:
+        """Computes level-weighted L2 penalty on fine hash table entries only.
+
+        Coarse levels (< ctf_start_levels) receive zero weight so broad surfaces stay
+        untouched, while finer levels ramp linearly to 1.0 to suppress collision speckles.
+        """
+        if self.hash_grid.tables is not None:
+            return ((self.hash_grid.tables ** 2) * self.fine_l2_weights).mean()
+        if self.hash_grid.tcnn_enc is not None:
+            params = list(self.hash_grid.tcnn_enc.parameters())
+            if params:
+                return sum((p ** 2).mean() for p in params) / len(params)
+        return torch.zeros((), device=self.fine_l2_weights.device, dtype=torch.float32)
+
+    def eval_local_3d_field(self, x: torch.Tensor) -> torch.Tensor:
+        """Differentiable local 3D occupancy/solidity scalar in (0, 1) at arbitrary 3D points.
+
+        Used by 3D curvature regularization and direct volumetric queries; matches the exact
+        scalar mapping extracted by Marching Cubes.
+        """
+        orig_shape = x.shape[:-1]
+        p = x.reshape(-1, 3)
+        h = self.hash_grid(p)
+        parts = [h, p / self.hash_grid.bound]
+        if self.use_viewdir:
+            parts.append(torch.zeros_like(p))
+        if not self.local_cdf:
+            hidden_dim = self.ray_proj.out_features
+            parts.append(torch.zeros((p.shape[0], hidden_dim), device=p.device, dtype=p.dtype))
+        feat = self.cdf_mlp(torch.cat(parts, dim=-1))
+        raw = self.cdf_out(feat).squeeze(-1)
+        if self.cdf_mode == "softmax":
+            val = torch.sigmoid((raw - 3.5) / 2.5)
+        else:
+            val = 1.0 - torch.exp(-F.softplus(raw))
+        return val.reshape(*orig_shape)
 
     def forward_single_pass(
         self,
@@ -801,6 +903,69 @@ def compute_hash_sck_loss(
     return total_loss
 
 
+def compute_3d_curvature_loss(
+    model: torch.nn.Module,
+    ray_o: torch.Tensor,
+    ray_d: torch.Tensor,
+    hit_range: torch.Tensor,
+    hit_mask: Optional[torch.Tensor] = None,
+    num_samples: int = 1024,
+    eps: float = 0.05,
+    s_max: float = 15.0,
+) -> torch.Tensor:
+    """Neuralangelo-style 2nd-order finite-difference 3D curvature (Laplacian) regularizer.
+
+    Samples 3D points near observed hit surfaces (75%) and along observed ray interiors (25%),
+    evaluates f(x + δ), f(x), f(x - δ) along random unit 3D directions in one batched pass,
+    and penalizes (f(x + δ) - 2 f(x) + f(x - δ))^2. Because the second derivative vanishes on
+    planar ramps, it flattens noisy hash-grid bumps/cauliflower ripples while preserving sharp
+    planar walls, roofs, and trunks. Zero CPU-GPU syncs.
+    """
+    orig = getattr(model, "_orig_mod", model)
+    B = ray_o.shape[0]
+    device = ray_o.device
+    n = min(int(num_samples), B)
+    if n <= 0:
+        return torch.zeros((), device=device, dtype=torch.float32)
+
+    idx = torch.randint(0, B, (n,), device=device)
+    o_s = ray_o[idx]
+    d_s = ray_d[idx]
+    r_s = hit_range.view(-1)[idx].clamp(0.1, s_max)
+    m_s = hit_mask.view(-1)[idx] if hit_mask is not None else torch.ones((n,), device=device)
+
+    n_surf = int(0.75 * n)
+    # 75% near surfaces (jittered around hit points on hitting rays; random along ray on sky rays)
+    u_sky = torch.rand((n_surf,), device=device)
+    t_surf = torch.where(m_s[:n_surf] > 0.5, r_s[:n_surf], 0.1 + u_sky * (s_max - 0.1))
+    x_surf = o_s[:n_surf] + t_surf.unsqueeze(-1) * d_s[:n_surf]
+    x_surf = x_surf + torch.randn_like(x_surf) * (2.5 * eps)
+
+    # 25% along observed ray interiors [0.1, t_end] to suppress free-space speckles
+    n_free = n - n_surf
+    t_end = torch.where(m_s[n_surf:] > 0.5, r_s[n_surf:], torch.full((n_free,), s_max, device=device))
+    t_free = 0.1 + torch.rand((n_free,), device=device) * torch.clamp(t_end - 0.1, min=0.05)
+    x_free = o_s[n_surf:] + t_free.unsqueeze(-1) * d_s[n_surf:]
+
+    x_mid = torch.cat([x_surf, x_free], dim=0)  # (n, 3)
+
+    # Random unit 3D perturbation direction
+    u_dir = torch.randn_like(x_mid)
+    u_dir = u_dir / torch.clamp(torch.linalg.norm(u_dir, dim=-1, keepdim=True), min=1e-6)
+    delta = float(eps) * u_dir
+
+    pts = torch.cat([x_mid, x_mid + delta, x_mid - delta], dim=0)  # (3n, 3)
+    vals = orig.eval_local_3d_field(pts).view(3, n)
+    lap = vals[1] - 2.0 * vals[0] + vals[2]
+    return (lap * lap).mean()
+
+
+def compute_fine_hash_l2_loss(model: torch.nn.Module) -> torch.Tensor:
+    """Wrapper calling HashSCKNetwork.fine_hash_l2_loss() safely across torch.compile."""
+    orig = getattr(model, "_orig_mod", model)
+    return orig.fine_hash_l2_loss()
+
+
 def train_hash_sck_model(
     model: HashSCKNetwork,
     dataloader: GPURayBatcher,
@@ -811,6 +976,14 @@ def train_hash_sck_model(
     augment_origin_slide: bool = True,
     lambda_raydrop: float = 0.1,
     lambda_sky_cdf: float = 0.1,
+    lambda_curv: Optional[float] = None,
+    curv_samples: Optional[int] = None,
+    curv_eps_start: Optional[float] = None,
+    curv_eps_end: Optional[float] = None,
+    coarse_to_fine: Optional[bool] = None,
+    ctf_start_levels: Optional[int] = None,
+    ctf_end_frac: Optional[float] = None,
+    lambda_hash_l2: Optional[float] = None,
     s_max: Optional[float] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
@@ -819,17 +992,36 @@ def train_hash_sck_model(
     """High-throughput sync-free training loop for HashSCKNetwork.
 
     Uses separate hash-table and MLP learning rates, fused Adam (when on CUDA),
-    optional CosineAnnealingLR, and GPU-resident loss accumulation (only a single
-    CPU-GPU sync per epoch).
+    optional CosineAnnealingLR, progressive coarse-to-fine hash level masking,
+    3D curvature (Laplacian) smoothness regularization, fine-level hash L2 decay,
+    and GPU-resident loss accumulation (only a single CPU-GPU sync per epoch).
+    Regularization arguments default to the attributes configured on `model`.
     """
+    orig = getattr(model, "_orig_mod", model)
     if device is None:
-        device = next(model.parameters()).device
+        device = next(orig.parameters()).device
     if s_max is None:
-        s_max = model.s_max
+        s_max = orig.s_max
+    if lambda_curv is None:
+        lambda_curv = orig.lambda_curv
+    if curv_samples is None:
+        curv_samples = orig.curv_samples
+    if curv_eps_start is None:
+        curv_eps_start = orig.curv_eps_start
+    if curv_eps_end is None:
+        curv_eps_end = orig.curv_eps_end
+    if coarse_to_fine is None:
+        coarse_to_fine = orig.coarse_to_fine
+    if ctf_start_levels is None:
+        ctf_start_levels = orig.ctf_start_levels
+    if ctf_end_frac is None:
+        ctf_end_frac = orig.ctf_end_frac
+    if lambda_hash_l2 is None:
+        lambda_hash_l2 = orig.lambda_hash_l2
 
     fused_ok = device.type == "cuda"
     optimizer = torch.optim.Adam(
-        model.parameter_groups(lr_mlp=lr_mlp, lr_hash=lr_hash),
+        orig.parameter_groups(lr_mlp=lr_mlp, lr_hash=lr_hash),
         eps=1e-15,
         fused=fused_ok,
     )
@@ -842,14 +1034,23 @@ def train_hash_sck_model(
     loss_history: List[float] = []
     epoch_times: List[float] = []
     dataset_len = dataloader.N if hasattr(dataloader, "N") else len(dataloader)
+    steps_per_epoch = max(1, len(dataloader))
+    total_steps = max(1, num_epochs * steps_per_epoch)
+    ctf_steps = max(1.0, float(ctf_end_frac) * total_steps)
+
+    if not coarse_to_fine:
+        orig.hash_grid.set_active_levels(orig.hash_grid.n_levels)
 
     if verbose:
         print(
             f"Training HashSCKNetwork on {device} "
-            f"({dataset_len:,} rays, {len(dataloader)} batches/epoch, "
-            f"origin_slide={augment_origin_slide}, sky_carving={lambda_sky_cdf})..."
+            f"({dataset_len:,} rays, {steps_per_epoch} batches/epoch, "
+            f"origin_slide={augment_origin_slide}, sky_carving={lambda_sky_cdf}, "
+            f"coarse_to_fine={coarse_to_fine}, lambda_curv={lambda_curv}, "
+            f"lambda_hash_l2={lambda_hash_l2})..."
         )
 
+    global_step = 0
     for epoch in range(num_epochs):
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -860,6 +1061,10 @@ def train_hash_sck_model(
         num_batches = len(dataloader)
 
         for batch in dataloader:
+            ctf_prog = min(1.0, global_step / ctf_steps)
+            if coarse_to_fine:
+                orig.set_coarse_to_fine_progress(ctf_prog, start_levels=ctf_start_levels)
+
             optimizer.zero_grad(set_to_none=True)
             ray_o = batch["ray_o"]
             ray_d = batch["ray_d"]
@@ -884,9 +1089,26 @@ def train_hash_sck_model(
                 lambda_sky_cdf=lambda_sky_cdf,
                 s_max=s_max,
             )
+            if lambda_curv > 0.0:
+                curv_eps = curv_eps_start + ctf_prog * (curv_eps_end - curv_eps_start)
+                loss_curv = compute_3d_curvature_loss(
+                    model=orig,
+                    ray_o=ray_o,
+                    ray_d=ray_d,
+                    hit_range=hit_range,
+                    hit_mask=hit_mask,
+                    num_samples=curv_samples,
+                    eps=curv_eps,
+                    s_max=s_max,
+                )
+                loss = loss + lambda_curv * loss_curv
+            if lambda_hash_l2 > 0.0:
+                loss = loss + lambda_hash_l2 * orig.fine_hash_l2_loss()
+
             loss.backward()
             optimizer.step()
             epoch_loss_gpu += loss.detach()
+            global_step += 1
 
         if scheduler is not None:
             scheduler.step()

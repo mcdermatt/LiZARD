@@ -3,6 +3,8 @@ Exploring LiDAR-Based Neural Hazard Fields
 
 ## TODO:
 
+* anchor view and look direction wrt nodes, make knots be treated as factors, alowwing online correcton of poses in training data
+
 * incorporate density into total hashmap visualiztion
 
 * implement **knot-flow-guided coarse-to-fine Marching Cubes** in `train_live.py` (use the learned knot shift network on virtual multi-viewpoint probe rays to discover thin occupied blocks without leaking training data, enabling $O(R^2)$ high-res `256–512+` meshing)
