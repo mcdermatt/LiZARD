@@ -1527,20 +1527,6 @@ def _gaussian_blur_3d(vol_5d: torch.Tensor, sigma: float, radius: int) -> torch.
     return x
 
 
-def _gaussian_blur_3d_valid(vol_5d: torch.Tensor, sigma: float, radius: int) -> torch.Tensor:
-    """Separable 3D Gaussian blur with padding=0, stripping a `radius`-voxel halo cleanly.
-
-    Used on halo-padded sparse blocks so boundary values match a global dense blur identically.
-    """
-    coords = torch.arange(-radius, radius + 1, device=vol_5d.device, dtype=vol_5d.dtype)
-    k = torch.exp(-0.5 * (coords / sigma) ** 2)
-    k = k / k.sum()
-    x = F.conv3d(vol_5d, k.view(1, 1, -1, 1, 1), padding=0)
-    x = F.conv3d(x, k.view(1, 1, 1, -1, 1), padding=0)
-    x = F.conv3d(x, k.view(1, 1, 1, 1, -1), padding=0)
-    return x
-
-
 @torch.no_grad()
 def _eval_hash_points_gpu(
     orig: HashSCKNetwork,
@@ -1659,10 +1645,9 @@ def eval_hash_3d_volume_gpu(
         orig.train()
 
     vol_5d = vals.view(1, 1, nx, ny, nz)
-    v_smooth_t = _gaussian_blur_3d(vol_5d, sigma=0.85, radius=2)
     v_wide_t = _gaussian_blur_3d(vol_5d, sigma=3.0, radius=6)
 
-    v_smooth = v_smooth_t[0, 0].cpu().numpy().astype(np.float32)
+    v_smooth = vol_5d[0, 0].cpu().numpy().astype(np.float32)
     v_wide = v_wide_t[0, 0].cpu().numpy().astype(np.float32)
 
     origin = (x0, y0, z0)
@@ -1746,8 +1731,8 @@ def eval_hash_3d_blocks_knotflow_gpu(
        (dc > dc_thresh), catching thin features without touching training data.
     2. Runs a fast coarse 3D field pass (coarse_res=64) to catch any large occluded regions
        and compute the wide low-frequency blur (v_wide_coarse) for clump isolation.
-    3. Evaluates the fine 3D hash+MLP field ONLY inside active blocks (with a 2-voxel blur
-       halo so shared block faces are bit-for-bit identical across adjacent blocks).
+    3. Evaluates the raw (unblurred) fine 3D hash+MLP field ONLY inside active blocks
+       so shared block faces are bit-for-bit identical across adjacent blocks.
     """
     orig = getattr(model, "_orig_mod", model)
     if not isinstance(orig, HashSCKNetwork):
@@ -1842,11 +1827,9 @@ def eval_hash_3d_blocks_knotflow_gpu(
     n_kf_only = int((active_kf & ~active_coarse).sum().item())
     active_coords = torch.nonzero(active_blocks, as_tuple=False).cpu().tolist()
 
-    # --- Stage 3: Evaluate fine 3D field ONLY inside active blocks (with exact 2-voxel halo) ---
-    halo = 2
-    pad_len = B + 1 + 2 * halo  # 21 for B=16, halo=2
-    local_pad = torch.arange(-halo, B + 1 + halo, device=device, dtype=torch.long)  # (21,)
-    local_core = torch.arange(0, B + 1, device=device, dtype=torch.long)  # (17,)
+    # --- Stage 3: Evaluate raw (unblurred) fine 3D field ONLY inside active blocks ---
+    core_len = B + 1  # 17 for B=16
+    local_core = torch.arange(0, core_len, device=device, dtype=torch.long)  # (17,)
     inv_span_x = 2.0 / max(sx, 1e-6)
     inv_span_y = 2.0 / max(sy, 1e-6)
     inv_span_z = 2.0 / max(sz, 1e-6)
@@ -1863,23 +1846,20 @@ def eval_hash_3d_blocks_knotflow_gpu(
         dims_list = []
         for bx, by, bz in batch_coords:
             ix0, iy0, iz0 = bx * B, by * B, bz * B
-            wx = min(B + 1, nx - ix0)
-            wy = min(B + 1, ny - iy0)
-            wz = min(B + 1, nz - iz0)
+            wx = min(core_len, nx - ix0)
+            wy = min(core_len, ny - iy0)
+            wz = min(core_len, nz - iz0)
             dims_list.append((bx, by, bz, wx, wy, wz))
-
-            ix_p = (ix0 + local_pad).clamp(0, nx - 1)
-            iy_p = (iy0 + local_pad).clamp(0, ny - 1)
-            iz_p = (iz0 + local_pad).clamp(0, nz - 1)
-            px = x0 + ix_p.float() * dx
-            py = y0 + iy_p.float() * dy
-            pz = z0 + iz_p.float() * dz
-            gx, gy, gz = torch.meshgrid(px, py, pz, indexing="ij")
-            pts_list.append(torch.stack([gx, gy, gz], dim=-1))
 
             ix_c = (ix0 + local_core).clamp(0, nx - 1)
             iy_c = (iy0 + local_core).clamp(0, ny - 1)
             iz_c = (iz0 + local_core).clamp(0, nz - 1)
+            px = x0 + ix_c.float() * dx
+            py = y0 + iy_c.float() * dy
+            pz = z0 + iz_c.float() * dz
+            gx, gy, gz = torch.meshgrid(px, py, pz, indexing="ij")
+            pts_list.append(torch.stack([gx, gy, gz], dim=-1))
+
             cx_n = (ix_c.float() * dx) * inv_span_x - 1.0
             cy_n = (iy_c.float() * dy) * inv_span_y - 1.0
             cz_n = (iz_c.float() * dz) * inv_span_z - 1.0
@@ -1887,12 +1867,10 @@ def eval_hash_3d_blocks_knotflow_gpu(
             # F.grid_sample expects (z, y, x) order for (D, H, W) = (cnx, cny, cnz)
             grid_norm_list.append(torch.stack([gnz, gny, gnx], dim=-1))
 
-        pts_batch = torch.stack(pts_list, dim=0).reshape(-1, 3)  # (mb * 21^3, 3)
-        vals_batch = _eval_hash_points_gpu(orig, pts_batch, chunk_size=65536).view(
-            mb, 1, pad_len, pad_len, pad_len
+        pts_batch = torch.stack(pts_list, dim=0).reshape(-1, 3)  # (mb * 17^3, 3)
+        smooth_batch = _eval_hash_points_gpu(orig, pts_batch, chunk_size=65536).view(
+            mb, core_len, core_len, core_len
         )
-        # Valid-padded blur strips the 2-voxel halo -> exact (mb, 1, 17, 17, 17)
-        smooth_batch = _gaussian_blur_3d_valid(vals_batch, sigma=0.85, radius=halo)[:, 0]
 
         # Trilinearly sample wide background blur for all blocks in the mini-batch
         grid_norm_batch = torch.stack(grid_norm_list, dim=0)  # (mb, 17, 17, 17, 3)
@@ -2242,11 +2220,14 @@ class OnlineVisibilityGrid:
         self.inv_span = (dims_t - 1.0) / torch.clamp(span_t, min=1e-6)
         self.t_frac = torch.linspace(0.0, 1.0, samples_per_ray, device=self.device, dtype=torch.float32)
 
-        self.grid = torch.zeros((self.nx * self.ny * self.nz,), device=self.device, dtype=torch.uint8)
+        # Allocate +1 sentinel slot so out-of-bounds indices scatter without a CPU-GPU sync
+        self._sentinel_idx = self.nx * self.ny * self.nz
+        self.grid_buf = torch.zeros((self._sentinel_idx + 1,), device=self.device, dtype=torch.uint8)
+        self.grid = self.grid_buf[:-1]
 
     def reset(self) -> None:
         """Clears observed mask back to 0 (e.g. when resetting weights)."""
-        self.grid.zero_()
+        self.grid_buf.zero_()
 
     @torch.no_grad()
     def update_batch(
@@ -2256,7 +2237,7 @@ class OnlineVisibilityGrid:
         hit_range: torch.Tensor,
         hit_mask: Optional[torch.Tensor] = None,
     ) -> None:
-        """Marks voxels traversed by the observed segment of each ray in the batch."""
+        """Marks voxels traversed by the observed segment of each ray (zero CPU-GPU sync)."""
         r = hit_range.view(-1)
         if hit_mask is not None:
             m = hit_mask.view(-1)
@@ -2276,10 +2257,9 @@ class OnlineVisibilityGrid:
             & (ijk[..., 1] >= 0) & (ijk[..., 1] < self.ny)
             & (ijk[..., 2] >= 0) & (ijk[..., 2] < self.nz)
         )
-        ijk_v = ijk[inb]
-        if ijk_v.numel() > 0:
-            flat = (ijk_v[:, 0] * self.ny + ijk_v[:, 1]) * self.nz + ijk_v[:, 2]
-            self.grid[flat] = 1
+        flat = (ijk[..., 0] * self.ny + ijk[..., 1]) * self.nz + ijk[..., 2]
+        flat = torch.where(inb, flat, self._sentinel_idx).reshape(-1)
+        self.grid_buf.index_fill_(0, flat, 1)
 
     @torch.no_grad()
     def get_observed_mask_numpy(self, target_shape: Tuple[int, int, int]) -> np.ndarray:
@@ -2753,12 +2733,18 @@ def make_optimizer_and_scheduler(
     if args.model == "hash":
         orig = getattr(model, "_orig_mod", model)
         optimizer = torch.optim.Adam(
-            orig.parameter_groups(lr_mlp=args.lr_mlp, lr_hash=args.lr_hash),
+            orig.parameter_groups(
+                lr_mlp=args.lr_mlp,
+                lr_hash=args.lr_hash,
+                lr_shift_hash=args.lr_shift_hash,
+            ),
             eps=1e-15,
             fused=fused_ok,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, args.epochs), eta_min=args.lr_mlp * 0.05
+        t_max = max(1, args.epochs)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda ep: 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, ep / t_max))),
         )
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=args.lr_fourier, fused=fused_ok)
@@ -2772,7 +2758,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-dir", type=str, default="data", help="Directory containing training_scans.npz / scans/ (default: data)")
     parser.add_argument("--model", type=str, choices=["hash", "fourier"], default="hash", help="Model architecture (default: hash)")
-    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs (default: 30)")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs (default: 30)")
     parser.add_argument(
         "--vis-every",
         type=float,
@@ -2786,16 +2772,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hidden-dim", type=int, default=None, help="MLP hidden dim (default: 64 for hash, 256 for fourier)")
     parser.add_argument("--cdf-mode", type=str, choices=["softmax", "hazard"], default="softmax", help="CDF parameterization (default: softmax)")
     parser.add_argument("--joint-cdf", action="store_true", help="(Hash model) Condition CDF head on ray_feat instead of pure 3D local readout")
+    parser.add_argument("--shared-shift-grid", action="store_true", help="(Hash model) Share the fine scene hash grid with the knot-shift MLP instead of using a separate coarse shift hash grid")
     parser.add_argument("--lr-mlp", type=float, default=1e-3, help="(Hash model) MLP learning rate (default: 1e-3)")
-    parser.add_argument("--lr-hash", type=float, default=1e-2, help="(Hash model) Hash table learning rate (default: 1e-2)")
+    parser.add_argument("--lr-hash", type=float, default=1e-2, help="(Hash model) Scene hash table learning rate (default: 1e-2)")
+    parser.add_argument("--lr-shift-hash", type=float, default=2e-3, help="(Hash model) Shift hash table learning rate (default: 2e-3)")
     parser.add_argument("--lr-fourier", type=float, default=5e-4, help="(Fourier model) Learning rate (default: 5e-4)")
     parser.add_argument("--lambda-raydrop", type=float, default=0.1, help="Ray-drop BCE loss weight (default: 0.1)")
     parser.add_argument("--lambda-sky-cdf", type=float, default=0.1, help="(Hash model) Sky empty-space carving weight (default: 0.1)")
-    parser.add_argument("--lambda-curv", type=float, default=0.05, help="(Hash model) 3D curvature (2nd-order Laplacian) smoothness weight (default: 0.05; 0 to disable)")
-    parser.add_argument("--curv-samples", type=int, default=1024, help="(Hash model) 3D points per batch for curvature loss (default: 1024)")
+    parser.add_argument("--lambda-curv", type=float, default=None, help="(Hash model) 3D curvature (2nd-order Laplacian) smoothness weight (default: from HashSCKNetwork)")
+    parser.add_argument("--curv-samples", type=int, default=None, help="(Hash model) 3D points per batch for curvature loss (default: from HashSCKNetwork)")
     parser.add_argument("--no-coarse-to-fine", action="store_true", help="(Hash model) Disable progressive coarse-to-fine hash level masking")
-    parser.add_argument("--ctf-start-levels", type=int, default=4, help="(Hash model) Initial active coarse hash levels at Epoch 0 (default: 4)")
-    parser.add_argument("--ctf-end-frac", type=float, default=0.6, help="(Hash model) Training fraction at which all hash levels are fully unlocked (default: 0.6)")
+    parser.add_argument("--ctf-start-levels", type=int, default=None, help="(Hash model) Initial active coarse hash levels at Epoch 0 (default: from HashSCKNetwork)")
+    parser.add_argument("--ctf-end-frac", type=float, default=None, help="(Hash model) Training fraction at which all hash levels unlock (default: from HashSCKNetwork)")
+    parser.add_argument("--lambda-hash-l2", type=float, default=None, help="(Hash model) Fine-level-only L2 decay on hash tables (default: from HashSCKNetwork; 0 to disable)")
+    parser.add_argument("--reg-every", type=int, default=None, help="(Hash model) Lazy regularization cadence for curvature + fine hash L2 (default: from HashSCKNetwork, 4; 1 = every step)")
     parser.add_argument("--origin-slide", action="store_true", help="Enable vectorized GPU origin-sliding augmentation")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (adds one-time JIT compile at Epoch 1, ~19%% faster after)")
 
@@ -2831,7 +2821,7 @@ def main() -> None:
         raise ValueError("--vis-every must be strictly positive (e.g. 0.25 or 1.0).")
 
     if args.batch_size is None:
-        args.batch_size = 2048 if args.model == "hash" else 1024
+        args.batch_size = 4096 if args.model == "hash" else 1024
     if args.num_rounds is None:
         args.num_rounds = 2 if args.model == "hash" else 3
     if args.hidden_dim is None:
@@ -2868,17 +2858,34 @@ def main() -> None:
 
     # 2. Build model (defaults to HashSCKNetwork)
     if args.model == "hash":
-        model: torch.nn.Module = HashSCKNetwork(
-            num_knots=args.num_knots,
-            s_min=0.1,
-            s_max=args.s_max,
-            hidden_dim=args.hidden_dim,
-            num_hidden_blocks=1,
-            num_rounds=args.num_rounds,
-            cdf_mode=args.cdf_mode,
-            local_cdf=not args.joint_cdf,
-            scene_bound=args.s_max,
-        ).to(device)
+        hash_kwargs: Dict[str, Any] = {
+            "num_knots": args.num_knots,
+            "s_min": 0.1,
+            "s_max": args.s_max,
+            "hidden_dim": args.hidden_dim,
+            "num_hidden_blocks": 1,
+            "num_rounds": args.num_rounds,
+            "cdf_mode": args.cdf_mode,
+            "local_cdf": not args.joint_cdf,
+            "scene_bound": args.s_max,
+        }
+        if args.shared_shift_grid:
+            hash_kwargs["separate_shift_grid"] = False
+        if args.no_coarse_to_fine:
+            hash_kwargs["coarse_to_fine"] = False
+        if args.ctf_start_levels is not None:
+            hash_kwargs["ctf_start_levels"] = args.ctf_start_levels
+        if args.ctf_end_frac is not None:
+            hash_kwargs["ctf_end_frac"] = args.ctf_end_frac
+        if args.lambda_curv is not None:
+            hash_kwargs["lambda_curv"] = args.lambda_curv
+        if args.curv_samples is not None:
+            hash_kwargs["curv_samples"] = args.curv_samples
+        if args.lambda_hash_l2 is not None:
+            hash_kwargs["lambda_hash_l2"] = args.lambda_hash_l2
+        if args.reg_every is not None:
+            hash_kwargs["reg_every"] = args.reg_every
+        model: torch.nn.Module = HashSCKNetwork(**hash_kwargs).to(device)
     else:
         model = DeeperSCKNetwork(
             num_knots=args.num_knots,
@@ -3190,13 +3197,21 @@ def main() -> None:
     # 5. Train directly on the main thread at 100% native GPU speed
     orig_model = getattr(model, "_orig_mod", model)
     total_train_steps = max(1, args.epochs * steps_per_epoch)
-    ctf_steps = max(1.0, float(args.ctf_end_frac) * total_train_steps)
-    use_ctf = (args.model == "hash") and (not args.no_coarse_to_fine)
+    use_ctf = (args.model == "hash") and orig_model.coarse_to_fine
+    ctf_steps = max(1.0, float(orig_model.ctf_end_frac) * total_train_steps) if args.model == "hash" else 1.0
     if args.model == "hash":
+        shift_lr_str = (
+            f", lr_shift_hash={args.lr_shift_hash:g}"
+            if orig_model.shift_hash_grid is not None
+            else " (shared shift grid)"
+        )
         print(
-            f"3D Smoothness: coarse_to_fine={use_ctf} "
-            f"(lvls {args.ctf_start_levels}->{orig_model.hash_grid.n_levels} over {args.ctf_end_frac * 100:.0f}% epochs), "
-            f"lambda_curv={args.lambda_curv} ({args.curv_samples} pts/batch)",
+            f"Optimizer LRs: lr_mlp={args.lr_mlp:g}, lr_hash={args.lr_hash:g}{shift_lr_str} "
+            f"(proportional cosine -> 5%)\n"
+            f"3D Regularization: coarse_to_fine={use_ctf} "
+            f"(lvls {orig_model.ctf_start_levels}->{orig_model.hash_grid.n_levels} over {orig_model.ctf_end_frac * 100:.0f}% epochs), "
+            f"lambda_curv={orig_model.lambda_curv} ({orig_model.curv_samples} pts/batch), "
+            f"lambda_hash_l2={orig_model.lambda_hash_l2} (every {orig_model.reg_every} steps)",
             flush=True,
         )
 
@@ -3213,7 +3228,7 @@ def main() -> None:
             vis_grid.reset()
             if args.model == "hash":
                 if use_ctf:
-                    active_lvls = orig_model.set_coarse_to_fine_progress(0.0, start_levels=args.ctf_start_levels)
+                    active_lvls = orig_model.set_coarse_to_fine_progress(0.0)
                 else:
                     orig_model.hash_grid.set_active_levels(orig_model.hash_grid.n_levels)
             cached_vol_info["mode"] = None
@@ -3262,9 +3277,7 @@ def main() -> None:
 
                     ctf_prog = min(1.0, global_step / ctf_steps)
                     if use_ctf:
-                        active_lvls = orig_model.set_coarse_to_fine_progress(
-                            ctf_prog, start_levels=args.ctf_start_levels
-                        )
+                        active_lvls = orig_model.set_coarse_to_fine_progress(ctf_prog)
 
                     optimizer.zero_grad(set_to_none=True)
                     ray_o = batch["ray_o"]
@@ -3272,8 +3285,9 @@ def main() -> None:
                     hit_range = batch["hit_range"]
                     hit_mask = batch["hit_mask"]
 
-                    # Online visibility tracking directly from incoming rays (~0.7 ms/batch)
-                    vis_grid.update_batch(ray_o, ray_d, hit_range, hit_mask)
+                    # Online visibility tracking (sync-free; dataset is fixed so Epoch 0 covers all rays)
+                    if epoch == 0:
+                        vis_grid.update_batch(ray_o, ray_d, hit_range, hit_mask)
 
                     if args.origin_slide:
                         ray_o, hit_range, _ = vectorized_gpu_origin_slide(
@@ -3295,19 +3309,25 @@ def main() -> None:
                             lambda_sky_cdf=args.lambda_sky_cdf,
                             s_max=args.s_max,
                         )
-                        if args.lambda_curv > 0.0:
-                            curv_eps = 0.12 + ctf_prog * (0.03 - 0.12)
-                            loss_curv = compute_3d_curvature_loss(
-                                model=orig_model,
-                                ray_o=ray_o,
-                                ray_d=ray_d,
-                                hit_range=hit_range,
-                                hit_mask=hit_mask,
-                                num_samples=args.curv_samples,
-                                eps=curv_eps,
-                                s_max=args.s_max,
-                            )
-                            loss = loss + args.lambda_curv * loss_curv
+                        if (global_step % orig_model.reg_every) == 0:
+                            reg_scale = float(orig_model.reg_every)
+                            if orig_model.lambda_curv > 0.0:
+                                curv_eps = orig_model.curv_eps_start + ctf_prog * (
+                                    orig_model.curv_eps_end - orig_model.curv_eps_start
+                                )
+                                loss_curv = compute_3d_curvature_loss(
+                                    model=orig_model,
+                                    ray_o=ray_o,
+                                    ray_d=ray_d,
+                                    hit_range=hit_range,
+                                    hit_mask=hit_mask,
+                                    num_samples=orig_model.curv_samples,
+                                    eps=curv_eps,
+                                    s_max=args.s_max,
+                                )
+                                loss = loss + (reg_scale * orig_model.lambda_curv) * loss_curv
+                            if orig_model.lambda_hash_l2 > 0.0:
+                                loss = loss + (reg_scale * orig_model.lambda_hash_l2) * orig_model.fine_hash_l2_loss()
                     else:
                         loss, _ = compute_sck_loss(
                             round_outputs=round_outputs,

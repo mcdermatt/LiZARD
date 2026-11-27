@@ -70,6 +70,7 @@ if HAS_TRITON:
         x_ptr,          # (M, 3) float32 normalized in [0, 1)
         table_ptr,      # (L, T, 2) float32
         res_ptr,        # (L,) float32
+        level_w_ptr,    # (L,) float32 per-level CTF weight in [0, 1]
         out_ptr,        # (M, L * 2) float32
         M,
         L: tl.constexpr,
@@ -81,6 +82,14 @@ if HAS_TRITON:
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = offs_m < M
+
+        lw = tl.load(level_w_ptr + pid_l)
+        out_base = offs_m.to(tl.int64) * (L * 2) + pid_l * 2
+        if lw == 0.0:
+            zeros = tl.zeros([BLOCK_M], dtype=tl.float32)
+            tl.store(out_ptr + out_base + 0, zeros, mask=mask_m)
+            tl.store(out_ptr + out_base + 1, zeros, mask=mask_m)
+            return
 
         # Load normalized 3D coordinates
         x = tl.load(x_ptr + offs_m * 3 + 0, mask=mask_m, other=0.0)
@@ -142,22 +151,23 @@ if HAS_TRITON:
                     acc0 += w * f0
                     acc1 += w * f1
 
-        out_base = offs_m.to(tl.int64) * (L * 2) + pid_l * 2
-        tl.store(out_ptr + out_base + 0, acc0, mask=mask_m)
-        tl.store(out_ptr + out_base + 1, acc1, mask=mask_m)
+        tl.store(out_ptr + out_base + 0, acc0 * lw, mask=mask_m)
+        tl.store(out_ptr + out_base + 1, acc1 * lw, mask=mask_m)
 
     @triton.jit
     def _hash_grid_3d_bwd_kernel(
         x_ptr,              # (M, 3) float32 normalized in [0, 1)
         table_ptr,          # (L, T, 2) float32
         res_ptr,            # (L,) float32
+        level_w_ptr,        # (L,) float32 per-level CTF weight in [0, 1]
         grad_out_ptr,       # (M, L * 2) float32
-        grad_table_ptr,     # (L, T, 2) float32 (zero-initialized)
+        grad_table_ptr,     # (L, T, 2) float32 (accumulated into in-place)
         grad_x_lvl_ptr,     # (M, L, 3) float32 (used only if COMPUTE_DX)
         M,
         L: tl.constexpr,
         T_MASK: tl.constexpr,
         COMPUTE_DX: tl.constexpr,
+        COMPUTE_DT: tl.constexpr,
         BLOCK_M: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
@@ -165,6 +175,21 @@ if HAS_TRITON:
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_m = offs_m < M
+
+        lw = tl.load(level_w_ptr + pid_l)
+        if lw == 0.0:
+            if COMPUTE_DX:
+                dx_base = (offs_m.to(tl.int64) * L + pid_l) * 3
+                zeros = tl.zeros([BLOCK_M], dtype=tl.float32)
+                tl.store(grad_x_lvl_ptr + dx_base + 0, zeros, mask=mask_m)
+                tl.store(grad_x_lvl_ptr + dx_base + 1, zeros, mask=mask_m)
+                tl.store(grad_x_lvl_ptr + dx_base + 2, zeros, mask=mask_m)
+            return
+
+        g_base = offs_m.to(tl.int64) * (L * 2) + pid_l * 2
+        g0 = tl.load(grad_out_ptr + g_base + 0, mask=mask_m, other=0.0) * lw
+        g1 = tl.load(grad_out_ptr + g_base + 1, mask=mask_m, other=0.0) * lw
+        active_m = mask_m & ((g0 != 0.0) | (g1 != 0.0))
 
         x = tl.load(x_ptr + offs_m * 3 + 0, mask=mask_m, other=0.0)
         y = tl.load(x_ptr + offs_m * 3 + 1, mask=mask_m, other=0.0)
@@ -201,10 +226,6 @@ if HAS_TRITON:
         hz0 = iz0 * P3
         hz1 = iz1 * P3
 
-        g_base = offs_m.to(tl.int64) * (L * 2) + pid_l * 2
-        g0 = tl.load(grad_out_ptr + g_base + 0, mask=mask_m, other=0.0)
-        g1 = tl.load(grad_out_ptr + g_base + 1, mask=mask_m, other=0.0)
-
         level_base = pid_l * (T_MASK + 1) * 2
 
         gx = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -229,12 +250,13 @@ if HAS_TRITON:
                     h = (hxy ^ hz) & T_MASK
                     addr = level_base + h.to(tl.int64) * 2
 
-                    tl.atomic_add(grad_table_ptr + addr + 0, w * g0, mask=mask_m)
-                    tl.atomic_add(grad_table_ptr + addr + 1, w * g1, mask=mask_m)
+                    if COMPUTE_DT:
+                        tl.atomic_add(grad_table_ptr + addr + 0, w * g0, mask=active_m)
+                        tl.atomic_add(grad_table_ptr + addr + 1, w * g1, mask=active_m)
 
                     if COMPUTE_DX:
-                        f0 = tl.load(table_ptr + addr + 0, mask=mask_m, other=0.0)
-                        f1 = tl.load(table_ptr + addr + 1, mask=mask_m, other=0.0)
+                        f0 = tl.load(table_ptr + addr + 0, mask=active_m, other=0.0)
+                        f1 = tl.load(table_ptr + addr + 1, mask=active_m, other=0.0)
                         dot = f0 * g0 + f1 * g1
                         gx += (dwx * wy * wz) * dot
                         gy += (wx * dwy * wz) * dot
@@ -249,7 +271,14 @@ if HAS_TRITON:
 
 class _TritonHashGrid3DFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x_norm: torch.Tensor, tables: torch.Tensor, resolutions: torch.Tensor):
+    def forward(
+        ctx,
+        x_norm: torch.Tensor,
+        tables: torch.Tensor,
+        resolutions: torch.Tensor,
+        level_weights: torch.Tensor,
+        direct_grad_accum: bool,
+    ):
         # x_norm: (M, 3) contiguous float32 in [0, 1)
         # tables: (L, T, 2) contiguous float32
         x_norm = x_norm.contiguous()
@@ -263,21 +292,35 @@ class _TritonHashGrid3DFn(torch.autograd.Function):
         BLOCK_M = 128
         grid = (triton.cdiv(M, BLOCK_M), L)
         _hash_grid_3d_fwd_kernel[grid](
-            x_norm, tables, resolutions, out,
+            x_norm, tables, resolutions, level_weights, out,
             M, L=L, T_MASK=T - 1, BLOCK_M=BLOCK_M,
         )
-        ctx.save_for_backward(x_norm, tables, resolutions)
+        ctx.save_for_backward(x_norm, tables, resolutions, level_weights)
+        ctx.direct_grad_accum = bool(direct_grad_accum)
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        x_norm, tables, resolutions = ctx.saved_tensors
+        x_norm, tables, resolutions, level_weights = ctx.saved_tensors
         grad_out = grad_out.contiguous().float()
         M = x_norm.shape[0]
         L, T, _ = tables.shape
         compute_dx = ctx.needs_input_grad[0]
+        compute_dt = ctx.needs_input_grad[1]
 
-        grad_tables = torch.zeros_like(tables)
+        if compute_dt:
+            if ctx.direct_grad_accum:
+                if tables.grad is None:
+                    tables.grad = torch.zeros_like(tables)
+                grad_tables_buf = tables.grad
+                ret_grad_tables = None
+            else:
+                grad_tables_buf = torch.zeros_like(tables)
+                ret_grad_tables = grad_tables_buf
+        else:
+            grad_tables_buf = torch.empty((1,), device=x_norm.device, dtype=torch.float32)
+            ret_grad_tables = None
+
         if compute_dx:
             grad_x_lvl = torch.empty((M, L, 3), device=x_norm.device, dtype=torch.float32)
         else:
@@ -286,12 +329,12 @@ class _TritonHashGrid3DFn(torch.autograd.Function):
         BLOCK_M = 128
         grid = (triton.cdiv(M, BLOCK_M), L)
         _hash_grid_3d_bwd_kernel[grid](
-            x_norm, tables, resolutions, grad_out, grad_tables, grad_x_lvl,
-            M, L=L, T_MASK=T - 1, COMPUTE_DX=compute_dx, BLOCK_M=BLOCK_M,
+            x_norm, tables, resolutions, level_weights, grad_out, grad_tables_buf, grad_x_lvl,
+            M, L=L, T_MASK=T - 1, COMPUTE_DX=compute_dx, COMPUTE_DT=compute_dt, BLOCK_M=BLOCK_M,
         )
 
         grad_x = grad_x_lvl.sum(dim=1) if compute_dx else None
-        return grad_x, grad_tables, None
+        return grad_x, ret_grad_tables, None, None, None
 
 
 class HashGrid3D(nn.Module):
@@ -340,7 +383,8 @@ class HashGrid3D(nn.Module):
             growth = 1.0
         resolutions = [int(round(base_resolution * (growth ** i))) for i in range(n_levels)]
         self.register_buffer("resolutions", torch.tensor(resolutions, dtype=torch.float32))
-        # Progressive coarse-to-fine level mask (all 1.0 = full resolution by default)
+        # Progressive coarse-to-fine level weights (all 1.0 = full resolution by default)
+        self.register_buffer("level_weights", torch.ones((n_levels,), dtype=torch.float32))
         self.register_buffer("level_mask", torch.ones((1, self.out_dim), dtype=torch.float32))
 
         if backend == "auto":
@@ -398,6 +442,7 @@ class HashGrid3D(nn.Module):
         with torch.no_grad():
             lvls = torch.arange(self.n_levels, device=self.level_mask.device, dtype=torch.float32)
             w = torch.clamp(float(active_levels) - lvls, 0.0, 1.0)
+            self.level_weights.copy_(w)
             self.level_mask.copy_(w.repeat_interleave(self.n_features).unsqueeze(0))
 
     def reset_parameters(self) -> None:
@@ -408,6 +453,7 @@ class HashGrid3D(nn.Module):
             elif self.tcnn_enc is not None:
                 for p in self.tcnn_enc.parameters():
                     p.uniform_(-1e-4, 1e-4)
+            self.level_weights.fill_(1.0)
             self.level_mask.fill_(1.0)
 
     def _forward_pytorch(self, x_norm: torch.Tensor) -> torch.Tensor:
@@ -442,13 +488,24 @@ class HashGrid3D(nn.Module):
         x_norm = ((x.reshape(-1, 3) + self.bound) / (2.0 * self.bound)).clamp(0.0, 1.0 - 1e-6)
 
         if self.backend == "tcnn" and x_norm.is_cuda:
-            out = self.tcnn_enc(x_norm).float()
+            out = self.tcnn_enc(x_norm).float() * self.level_mask
         elif self.backend == "triton" and x_norm.is_cuda and HAS_TRITON and self.n_features == 2:
-            out = _TritonHashGrid3DFn.apply(x_norm.float(), self.tables, self.resolutions)
+            # Direct in-place grad accumulation into tables.grad avoids repeated
+            # full-table zeros_like() allocations across self-conditioning rounds
+            # (falls back to functional grad_tables under torch.compile).
+            is_compiling = hasattr(torch, "compiler") and torch.compiler.is_compiling()
+            direct_accum = bool(
+                self.tables is not None
+                and self.tables.is_leaf
+                and self.tables.requires_grad
+                and not is_compiling
+            )
+            out = _TritonHashGrid3DFn.apply(
+                x_norm.float(), self.tables, self.resolutions, self.level_weights, direct_accum
+            )
         else:
-            out = self._forward_pytorch(x_norm)
+            out = self._forward_pytorch(x_norm) * self.level_mask
 
-        out = out * self.level_mask
         return out.reshape(*orig_shape, self.out_dim)
 
 
@@ -504,11 +561,19 @@ class HashSCKNetwork(nn.Module):
         curv_eps_start: Initial finite-difference step in meters for curvature loss (default 0.12).
         curv_eps_end: Final finite-difference step in meters for curvature loss (default 0.03).
         lambda_hash_l2: Fine-level-only L2 decay weight on hash tables (default 1e-3; 0 disables).
+        reg_every: Lazy regularization cadence for 3D curvature + fine hash L2 (default 4; 1 = every step).
+        separate_shift_grid: If True (default), uses a dedicated coarse HashGrid3D for
+            knot-shift prediction so empty-space attraction gradients never clash with
+            the fine scene HashGrid3D.
+        shift_n_levels: Resolution levels for shift_hash_grid (default 8).
+        shift_log2_hashmap_size: Log2 entries per level for shift_hash_grid (default 14).
+        shift_base_resolution: Coarsest grid resolution for shift_hash_grid (default 8).
+        shift_max_resolution: Finest grid resolution for shift_hash_grid (default 128).
     """
 
     def __init__(
         self,
-        num_knots: int = 32,                  # [Fidelity, Speed] Spline knots K/ray. More = finer depth/multi-surface resolution; scales hash lookups (2K-1/round) & MLP compute O(K).
+        num_knots: int = 16,                  # [Fidelity, Speed] Spline knots K/ray. More = finer depth/multi-surface resolution; scales hash lookups (2K-1/round) & MLP compute O(K).
         s_min: float = 0.1,                   # [Fidelity] Near pinned ray bound (m). Keep tight to closest valid return to avoid wasting knot spacing.
         s_max: float = 15.0,                  # [Fidelity] Far pinned ray bound (m) & default scene_bound. Tightening to max hit range boosts knot density for free.
         hidden_dim: int = 64,                 # [Fidelity, Speed] Width H of shift/CDF/ray-drop MLPs. Helps resolve hash collisions; scales MLP compute ~O(H^2 * K * R) (main MLP bottleneck).
@@ -518,13 +583,19 @@ class HashSCKNetwork(nn.Module):
         cdf_mode: str = "softmax",            # [Fidelity] 'softmax' (width-aware + escape bin, smoother grads) vs 'hazard' (Beer-Lambert quadrature, stricter volumetric additivity).
         local_cdf: bool = True,               # [Fidelity, Speed] True = 3D hash(x_mid) only -> best cross-ray consistency & novel views; False = adds ray_feat (+H inputs, slightly slower).
         use_viewdir: bool = False,            # [Fidelity] Appends unit ray_d (+3 dims) to cdf_mlp. Enable only for anisotropic/view-dependent returns; False preserves isotropic 3D consistency.
-        n_levels: int = 16,                   # [Fidelity, Speed, Hashmap] Multi-res grid scales (base -> max). More = smoother multi-scale detail; scales hashmap VRAM & kernel work O(L).
+        n_levels: int = 12,                   # [Fidelity, Speed, Hashmap] Multi-res grid scales (base -> max). More = smoother multi-scale detail; scales hashmap VRAM & kernel work O(L).
         n_features: int = 2,                  # [Fidelity, Speed, Hashmap] Channels/entry; scales hashmap VRAM O(F). Note: fused Triton kernel requires n_features=2 (else falls back to slow PyTorch without tcnn).
-        log2_hashmap_size: int = 18,          # [Fidelity, Hashmap] Entries/level T=2^P (16 -> 65,536). Top fidelity lever for fewer fine-level collisions at ~O(1) compute; doubles hashmap VRAM per +1 (~4x incl. Adam+grad).
-        base_resolution: int = 18,            # [Fidelity] Coarsest grid resolution across [-bound, +bound]. Lower smooths sparse views; higher shifts levels toward finer detail.
+        log2_hashmap_size: int = 16,          # [Fidelity, Hashmap] Entries/level T=2^P (16 -> 65,536). Top fidelity lever for fewer fine-level collisions at ~O(1) compute; doubles hashmap VRAM per +1 (~4x incl. Adam+grad).
+        base_resolution: int = 16,            # [Fidelity] Coarsest grid resolution across [-bound, +bound]. Lower smooths sparse views; higher shifts levels toward finer detail.
         max_resolution: int = 2048,            # [Fidelity] Finest grid resolution across 2*bound (voxel = 2*bound/max_res). Raise (1024-2048) with larger log2_hashmap_size for sharper thin edges.
         scene_bound: Optional[float] = None,  # [Fidelity] Half-extent of cubic 3D hash grid [-bound, +bound]^3 (default s_max). Free fidelity boost when tightened to actual scene AABB.
         hash_backend: str = "auto",           # [Speed, Hashmap] 'tcnn' (fastest + dense coarse levels, if installed) > 'triton' (fast fused CUDA, n_features=2) >> 'pytorch' (slow fallback).
+        # --- Separate Knot-Shift Hash Grid ("where to look" vs. "what is there") ---
+        separate_shift_grid: bool = True,     # [Fidelity, Speed, Hashmap] True = dedicated coarse HashGrid3D for knot shifts (eliminates empty-space vs. sharp-surface gradient tension & speeds up Stage A); False = share scene hash_grid.
+        shift_n_levels: int = 16,              # [Fidelity, Speed, Hashmap] Coarse resolution levels for shift_hash_grid (only used when separate_shift_grid=True).
+        shift_log2_hashmap_size: int = 14,    # [Fidelity, Hashmap] Entries/level T=2^P for shift_hash_grid (14 -> 16,384, ~1.05 MB total, L2-cache hot & low-collision).
+        shift_base_resolution: int = 14,       # [Fidelity] Coarsest grid resolution for shift_hash_grid (wide, smooth attraction basins in empty space).
+        shift_max_resolution: int = 1024,      # [Fidelity] Finest grid resolution for shift_hash_grid (smooth medium-scale pull without fine-level collision jitter).
         # --- 3D Smoothness & Regularization ---
         coarse_to_fine: bool = True,          # [Fidelity] Progressive coarse-to-fine hash masking: locks in smooth coarse walls/ground before fine levels unlock (~0% cost).
         ctf_start_levels: int = 4,            # [Fidelity] Number of coarsest collision-free hash levels active at Epoch 0 when coarse_to_fine=True.
@@ -534,6 +605,7 @@ class HashSCKNetwork(nn.Module):
         curv_eps_start: float = 0.12,         # [Fidelity] Initial finite-difference step size (m) for 3D curvature at Epoch 0 (smooths broad waves).
         curv_eps_end: float = 0.03,           # [Fidelity] Final finite-difference step size (m) for 3D curvature once fine levels unlock (smooths cm-scale ripples).
         lambda_hash_l2: float = 1e-3,         # [Fidelity] Fine-level-only L2 decay on hash tables (0 on coarse levels, linearly ramped to 1 on finest level). Kills collision speckles (~0% cost); too high (>1e-2) softens thin branches.
+        reg_every: int = 4,                   # [Speed] Lazy regularization cadence for 3D curvature + fine hash L2 (runs every N steps with N*lambda weight; 1 = every step).
     ):
         super().__init__()
         self.num_knots = num_knots
@@ -544,6 +616,7 @@ class HashSCKNetwork(nn.Module):
         self.cdf_mode = cdf_mode
         self.local_cdf = local_cdf
         self.use_viewdir = use_viewdir
+        self.separate_shift_grid = bool(separate_shift_grid)
         self.coarse_to_fine = bool(coarse_to_fine)
         self.ctf_start_levels = int(ctf_start_levels)
         self.ctf_end_frac = float(ctf_end_frac)
@@ -552,6 +625,7 @@ class HashSCKNetwork(nn.Module):
         self.curv_eps_start = float(curv_eps_start)
         self.curv_eps_end = float(curv_eps_end)
         self.lambda_hash_l2 = float(lambda_hash_l2)
+        self.reg_every = max(1, int(reg_every))
         bound = float(scene_bound) if scene_bound is not None else float(s_max)
 
         # Per-level weights for fine-only L2 decay: 0 on coarse levels (< ctf_start_levels),
@@ -561,7 +635,7 @@ class HashSCKNetwork(nn.Module):
         fine_w = torch.clamp((lvl_idx - self.ctf_start_levels + 1.0) / denom, 0.0, 1.0)
         self.register_buffer("fine_l2_weights", fine_w.view(n_levels, 1, 1))
 
-        # 1. Shared Multi-Resolution 3D Spatial Hash Grid
+        # 1a. High-Resolution 3D Scene Spatial Hash Grid ("what is there")
         self.hash_grid = HashGrid3D(
             n_levels=n_levels,
             n_features=n_features,
@@ -573,6 +647,22 @@ class HashSCKNetwork(nn.Module):
         )
         hash_dim = self.hash_grid.out_dim
 
+        # 1b. Optional Dedicated Coarse 3D Shift Hash Grid ("where to look")
+        if self.separate_shift_grid:
+            self.shift_hash_grid: Optional[HashGrid3D] = HashGrid3D(
+                n_levels=shift_n_levels,
+                n_features=n_features,
+                log2_hashmap_size=shift_log2_hashmap_size,
+                base_resolution=shift_base_resolution,
+                max_resolution=shift_max_resolution,
+                bound=bound,
+                backend=hash_backend,
+            )
+            shift_hash_dim = self.shift_hash_grid.out_dim
+        else:
+            self.shift_hash_grid = None
+            shift_hash_dim = hash_dim
+
         # 2. Compact Origin-Invariant Plücker Ray Encoder: (d, m = o x d) in R^6
         self.pos_enc_ray = PositionalEncoding(in_dim=6, num_freqs=4, max_coord=bound)
         self.ray_in = nn.Sequential(
@@ -583,7 +673,7 @@ class HashSCKNetwork(nn.Module):
 
         # Split joint projection so ray_feat is projected ONCE per ray (not K*R times!)
         self.ray_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.knot_proj = nn.Linear(hash_dim + 3, hidden_dim, bias=False)
+        self.knot_proj = nn.Linear(shift_hash_dim + 3, hidden_dim, bias=False)
 
         # 3. Lightweight Residual Shift Decoder (where to look)
         self.shift_blocks = nn.ModuleList([
@@ -621,13 +711,27 @@ class HashSCKNetwork(nn.Module):
         # Clean initial biases
         self._init_custom_biases()
 
-        hash_params = sum(p.numel() for p in self.hash_grid.parameters())
-        mlp_params = sum(p.numel() for p in self.parameters()) - hash_params
-        print(
-            f"HashSCKNetwork [{self.hash_grid.backend}] | "
-            f"MLP params: {mlp_params:,} | Hash table params: {hash_params:,} "
-            f"({hash_params * 4 / 1e6:.2f} MB)"
+        scene_hash_params = sum(p.numel() for p in self.hash_grid.parameters())
+        shift_hash_params = (
+            sum(p.numel() for p in self.shift_hash_grid.parameters())
+            if self.shift_hash_grid is not None
+            else 0
         )
+        hash_params = scene_hash_params + shift_hash_params
+        mlp_params = sum(p.numel() for p in self.parameters()) - hash_params
+        if self.shift_hash_grid is not None:
+            print(
+                f"HashSCKNetwork [{self.hash_grid.backend}] | "
+                f"MLP params: {mlp_params:,} | "
+                f"Scene hash: {scene_hash_params:,} ({scene_hash_params * 4 / 1e6:.2f} MB) | "
+                f"Shift hash: {shift_hash_params:,} ({shift_hash_params * 4 / 1e6:.2f} MB)"
+            )
+        else:
+            print(
+                f"HashSCKNetwork [{self.hash_grid.backend}] | "
+                f"MLP params: {mlp_params:,} | Shared hash: {scene_hash_params:,} "
+                f"({scene_hash_params * 4 / 1e6:.2f} MB)"
+            )
 
     def _init_custom_biases(self) -> None:
         with torch.no_grad():
@@ -658,12 +762,32 @@ class HashSCKNetwork(nn.Module):
             self._init_custom_biases()
 
     def parameter_groups(
-        self, lr_mlp: float = 1e-3, lr_hash: float = 1e-2, weight_decay_mlp: float = 1e-6
+        self,
+        lr_mlp: float = 1e-3,
+        lr_hash: float = 1e-2,
+        weight_decay_mlp: float = 1e-6,
+        lr_shift_hash: Optional[float] = 2e-3,
     ) -> List[Dict[str, Any]]:
-        """Returns Instant-NGP style optimizer param groups (higher LR for hash table)."""
-        hash_param_ids = {id(p) for p in self.hash_grid.parameters()}
-        hash_params = [p for p in self.parameters() if id(p) in hash_param_ids]
-        mlp_params = [p for p in self.parameters() if id(p) not in hash_param_ids]
+        """Returns Instant-NGP style optimizer param groups (split scene hash, shift hash, and MLP LRs)."""
+        scene_hash_ids = {id(p) for p in self.hash_grid.parameters()}
+        shift_hash_ids = (
+            {id(p) for p in self.shift_hash_grid.parameters()}
+            if self.shift_hash_grid is not None
+            else set()
+        )
+        all_hash_ids = scene_hash_ids | shift_hash_ids
+        mlp_params = [p for p in self.parameters() if id(p) not in all_hash_ids]
+
+        if lr_shift_hash is not None and self.shift_hash_grid is not None:
+            scene_hash_params = [p for p in self.parameters() if id(p) in scene_hash_ids]
+            shift_hash_params = [p for p in self.parameters() if id(p) in shift_hash_ids]
+            return [
+                {"params": scene_hash_params, "lr": lr_hash, "weight_decay": 0.0},
+                {"params": shift_hash_params, "lr": lr_shift_hash, "weight_decay": 0.0},
+                {"params": mlp_params, "lr": lr_mlp, "weight_decay": weight_decay_mlp},
+            ]
+
+        hash_params = [p for p in self.parameters() if id(p) in all_hash_ids]
         return [
             {"params": hash_params, "lr": lr_hash, "weight_decay": 0.0},
             {"params": mlp_params, "lr": lr_mlp, "weight_decay": weight_decay_mlp},
@@ -742,22 +866,24 @@ class HashSCKNetwork(nn.Module):
         """
         B, K = s_knots.shape
 
-        # --- Stage A: Predict interior knot shifts at current knot positions ---
-        x_knots = ray_o.unsqueeze(1) + s_knots.unsqueeze(-1) * ray_d.unsqueeze(1)  # (B, K, 3)
-        h_knots = self.hash_grid(x_knots)
-        knot_in = torch.cat([h_knots, x_knots / self.hash_grid.bound], dim=-1)
+        # --- Stage A: Predict interior knot shifts (endpoints are pinned at shift == 0) ---
+        shift_grid = self.shift_hash_grid if self.shift_hash_grid is not None else self.hash_grid
+        s_interior = s_knots[:, 1:-1]  # (B, K-2)
+        x_knots = ray_o.unsqueeze(1) + s_interior.unsqueeze(-1) * ray_d.unsqueeze(1)  # (B, K-2, 3)
+        h_knots = shift_grid(x_knots)
+        knot_in = torch.cat([h_knots, x_knots / shift_grid.bound], dim=-1)
 
         # Add pre-projected ray feature (computed once per ray!)
         h = F.relu(ray_proj_feat.unsqueeze(1) + self.knot_proj(knot_in))
         for block in self.shift_blocks:
             h = F.relu(h + block(h))
-        shift_logits = self.shift_head(h).squeeze(-1)  # (B, K)
+        shift_logits = self.shift_head(h).squeeze(-1)  # (B, K-2)
 
         # Pinned endpoints + 45% nearest-neighbor gap bound (strictly monotone, no sort)
         gaps = s_knots[:, 1:] - s_knots[:, :-1]  # (B, K-1)
         room = 0.45 * torch.minimum(gaps[:, :-1], gaps[:, 1:])  # (B, K-2)
         shift = torch.zeros_like(s_knots)
-        shift[:, 1:-1] = torch.tanh(shift_logits[:, 1:-1]) * torch.clamp(
+        shift[:, 1:-1] = torch.tanh(shift_logits) * torch.clamp(
             room, max=self.max_displacement
         )
         new_s_knots = s_knots + shift
@@ -972,6 +1098,7 @@ def train_hash_sck_model(
     num_epochs: int = 20,
     lr_mlp: float = 1e-3,
     lr_hash: float = 1e-2,
+    lr_shift_hash: Optional[float] = 2e-3,
     use_scheduler: bool = True,
     augment_origin_slide: bool = True,
     lambda_raydrop: float = 0.1,
@@ -984,6 +1111,7 @@ def train_hash_sck_model(
     ctf_start_levels: Optional[int] = None,
     ctf_end_frac: Optional[float] = None,
     lambda_hash_l2: Optional[float] = None,
+    reg_every: Optional[int] = None,
     s_max: Optional[float] = None,
     device: Optional[torch.device] = None,
     verbose: bool = True,
@@ -992,10 +1120,10 @@ def train_hash_sck_model(
     """High-throughput sync-free training loop for HashSCKNetwork.
 
     Uses separate hash-table and MLP learning rates, fused Adam (when on CUDA),
-    optional CosineAnnealingLR, progressive coarse-to-fine hash level masking,
-    3D curvature (Laplacian) smoothness regularization, fine-level hash L2 decay,
-    and GPU-resident loss accumulation (only a single CPU-GPU sync per epoch).
-    Regularization arguments default to the attributes configured on `model`.
+    optional proportional cosine LR decay, progressive coarse-to-fine hash level
+    masking, 3D curvature (Laplacian) smoothness regularization, fine-level hash
+    L2 decay, and GPU-resident loss accumulation (only a single CPU-GPU sync per
+    epoch). Regularization arguments default to the attributes configured on `model`.
     """
     orig = getattr(model, "_orig_mod", model)
     if device is None:
@@ -1018,15 +1146,20 @@ def train_hash_sck_model(
         ctf_end_frac = orig.ctf_end_frac
     if lambda_hash_l2 is None:
         lambda_hash_l2 = orig.lambda_hash_l2
+    reg_every_n = max(1, int(orig.reg_every if reg_every is None else reg_every))
 
     fused_ok = device.type == "cuda"
     optimizer = torch.optim.Adam(
-        orig.parameter_groups(lr_mlp=lr_mlp, lr_hash=lr_hash),
+        orig.parameter_groups(lr_mlp=lr_mlp, lr_hash=lr_hash, lr_shift_hash=lr_shift_hash),
         eps=1e-15,
         fused=fused_ok,
     )
+    t_max = max(1, num_epochs)
     scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=lr_mlp * 0.05)
+        torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda ep: 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, ep / t_max))),
+        )
         if use_scheduler
         else None
     )
@@ -1047,7 +1180,7 @@ def train_hash_sck_model(
             f"({dataset_len:,} rays, {steps_per_epoch} batches/epoch, "
             f"origin_slide={augment_origin_slide}, sky_carving={lambda_sky_cdf}, "
             f"coarse_to_fine={coarse_to_fine}, lambda_curv={lambda_curv}, "
-            f"lambda_hash_l2={lambda_hash_l2})..."
+            f"lambda_hash_l2={lambda_hash_l2}, reg_every={reg_every_n})..."
         )
 
     global_step = 0
@@ -1089,21 +1222,23 @@ def train_hash_sck_model(
                 lambda_sky_cdf=lambda_sky_cdf,
                 s_max=s_max,
             )
-            if lambda_curv > 0.0:
-                curv_eps = curv_eps_start + ctf_prog * (curv_eps_end - curv_eps_start)
-                loss_curv = compute_3d_curvature_loss(
-                    model=orig,
-                    ray_o=ray_o,
-                    ray_d=ray_d,
-                    hit_range=hit_range,
-                    hit_mask=hit_mask,
-                    num_samples=curv_samples,
-                    eps=curv_eps,
-                    s_max=s_max,
-                )
-                loss = loss + lambda_curv * loss_curv
-            if lambda_hash_l2 > 0.0:
-                loss = loss + lambda_hash_l2 * orig.fine_hash_l2_loss()
+            if (global_step % reg_every_n) == 0:
+                reg_scale = float(reg_every_n)
+                if lambda_curv > 0.0:
+                    curv_eps = curv_eps_start + ctf_prog * (curv_eps_end - curv_eps_start)
+                    loss_curv = compute_3d_curvature_loss(
+                        model=orig,
+                        ray_o=ray_o,
+                        ray_d=ray_d,
+                        hit_range=hit_range,
+                        hit_mask=hit_mask,
+                        num_samples=curv_samples,
+                        eps=curv_eps,
+                        s_max=s_max,
+                    )
+                    loss = loss + (reg_scale * lambda_curv) * loss_curv
+                if lambda_hash_l2 > 0.0:
+                    loss = loss + (reg_scale * lambda_hash_l2) * orig.fine_hash_l2_loss()
 
             loss.backward()
             optimizer.step()
