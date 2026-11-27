@@ -1020,6 +1020,7 @@ def generate_point_cloud(
     min_probability: float = 0.001,
     random_seed: Optional[int] = None,
     return_misses: bool = False,
+    samples_per_ray: int = 1,
 ) -> PointCloud:
     """
     Generates a synthetic LiDAR point cloud for a given sensor intrinsic and scene
@@ -1057,12 +1058,26 @@ def generate_point_cloud(
         Random seed for reproducible stochastic sampling.
     return_misses : bool, optional
         If True, rays that do not return are included at max_range with probability 0.
+    samples_per_ray : int, optional
+        Number of independent stochastic return samples drawn per ray from the same
+        traced intersections (default 1; values > 1 require method='sample').
     
     Returns
     -------
     PointCloud
         Synthesized point cloud with 3D points, return probabilities, ranges, normals, and metadata.
     """
+    samples_per_ray = int(samples_per_ray)
+    if samples_per_ray < 1:
+        raise ValueError(f"samples_per_ray must be >= 1, got {samples_per_ray}.")
+
+    method = method.lower()
+    return_placement = return_placement.lower()
+    if samples_per_ray > 1 and method != "sample":
+        raise ValueError(
+            f"samples_per_ray > 1 is only supported with method='sample' (got method='{method}')."
+        )
+
     if random_seed is not None:
         np.random.seed(random_seed)
 
@@ -1073,7 +1088,7 @@ def generate_point_cloud(
         flatten=True,
     )
 
-    # 2. Trace all rays through the scene and compute return probabilities
+    # 2. Trace all rays through the scene once and compute return probabilities
     ray_results = trace_scene_rays(
         rays_o=rays_o,
         rays_d=rays_d,
@@ -1092,112 +1107,113 @@ def generate_point_cloud(
     out_obj_idx = []
     out_ray_idx = []
 
-    method = method.lower()
-    return_placement = return_placement.lower()
+    zero_normal = np.zeros(3)
 
-    for ray_i, result in enumerate(ray_results):
-        hits = result["hits"]
-        if len(hits) == 0:
-            if return_misses:
-                miss_pt = rays_o[ray_i] + sensor.max_range * rays_d[ray_i]
-                out_points.append(miss_pt)
-                out_probs.append(0.0)
-                out_ranges.append(sensor.max_range)
-                out_normals.append(np.zeros(3))
-                out_ray_dirs.append(rays_d[ray_i])
-                out_rays_o.append(rays_o[ray_i])
-                out_obj_idx.append(-1)
-                out_ray_idx.append(ray_i)
-            continue
+    for _ in range(samples_per_ray):
+        for ray_i, result in enumerate(ray_results):
+            hits = result["hits"]
+            if len(hits) == 0:
+                if return_misses:
+                    miss_pt = rays_o[ray_i] + sensor.max_range * rays_d[ray_i]
+                    out_points.append(miss_pt)
+                    out_probs.append(0.0)
+                    out_ranges.append(sensor.max_range)
+                    out_normals.append(zero_normal)
+                    out_ray_dirs.append(rays_d[ray_i])
+                    out_rays_o.append(rays_o[ray_i])
+                    out_obj_idx.append(-1)
+                    out_ray_idx.append(ray_i)
+                continue
 
-        selected_hits = []
+            selected_hits = []
 
-        if method == "sample":
-            # Total probability of return for this ray
-            probs = np.array([h["return_prob"] for h in hits])
-            total_return_prob = np.sum(probs)
-            # Roll dice: does the ray produce a return?
-            if np.random.rand() < total_return_prob:
-                # Sample which surface generated the return
-                p_normalized = probs / total_return_prob
-                hit_idx = np.random.choice(len(hits), p=p_normalized)
-                selected_hits.append(hits[hit_idx])
-            elif return_misses:
-                miss_pt = rays_o[ray_i] + sensor.max_range * rays_d[ray_i]
-                out_points.append(miss_pt)
-                out_probs.append(0.0)
-                out_ranges.append(sensor.max_range)
-                out_normals.append(np.zeros(3))
-                out_ray_dirs.append(rays_d[ray_i])
-                out_rays_o.append(rays_o[ray_i])
-                out_obj_idx.append(-1)
-                out_ray_idx.append(ray_i)
+            if method == "sample":
+                # Draw surface return directly via the precomputed ray CDF
+                u_hit = np.random.rand()
+                selected = None
+                for h in hits:
+                    if u_hit < h["cdf"]:
+                        selected = h
+                        break
+                if selected is not None:
+                    selected_hits.append(selected)
+                elif return_misses:
+                    miss_pt = rays_o[ray_i] + sensor.max_range * rays_d[ray_i]
+                    out_points.append(miss_pt)
+                    out_probs.append(0.0)
+                    out_ranges.append(sensor.max_range)
+                    out_normals.append(zero_normal)
+                    out_ray_dirs.append(rays_d[ray_i])
+                    out_rays_o.append(rays_o[ray_i])
+                    out_obj_idx.append(-1)
+                    out_ray_idx.append(ray_i)
 
-        elif method in ("strongest", "max_prob"):
-            best_hit = max(hits, key=lambda h: h["return_prob"])
-            if best_hit["return_prob"] >= min_probability:
-                selected_hits.append(best_hit)
+            elif method in ("strongest", "max_prob"):
+                best_hit = max(hits, key=lambda h: h["return_prob"])
+                if best_hit["return_prob"] >= min_probability:
+                    selected_hits.append(best_hit)
 
-        elif method == "first_hit":
-            first_hit = hits[0]
-            if first_hit["return_prob"] >= min_probability:
-                selected_hits.append(first_hit)
+            elif method == "first_hit":
+                first_hit = hits[0]
+                if first_hit["return_prob"] >= min_probability:
+                    selected_hits.append(first_hit)
 
-        elif method == "all":
-            selected_hits.extend(hits)
+            elif method == "all":
+                selected_hits.extend(hits)
 
-        elif method == "threshold":
-            for h in hits:
-                if h["return_prob"] >= min_probability:
-                    selected_hits.append(h)
-        else:
-            raise ValueError(
-                f"Unknown method '{method}'. Choose from: 'sample', 'strongest', 'first_hit', 'all', 'threshold'."
-            )
-
-        for h in selected_hits:
-            density = h["density"]
-            chord = h["chord"]
-            t_in = h["t_in"]
-
-            if return_placement in ("volume", "penetration", "inside"):
-                if density > 1e-7 and chord > 1e-7:
-                    p_chord = 1.0 - np.exp(-density * chord)
-                    if method == "sample":
-                        # Sample penetration depth inside the volume according to exponential distribution
-                        u = np.random.rand()
-                        s = -np.log(np.maximum(1e-15, 1.0 - u * p_chord)) / density
-                    else:
-                        # Expected penetration depth for deterministic modes
-                        exp_decay = np.exp(-density * chord)
-                        if abs(p_chord) > 1e-7:
-                            s = (1.0 / density) - (chord * exp_decay / p_chord)
-                        else:
-                            s = chord / 2.0
-                    s = np.clip(s, 0.0, chord)
-                else:
-                    s = 0.0
-                t_ret = t_in + s
-                pt_ret = rays_o[ray_i] + t_ret * rays_d[ray_i]
+            elif method == "threshold":
+                for h in hits:
+                    if h["return_prob"] >= min_probability:
+                        selected_hits.append(h)
             else:
-                # Near surface placement
-                t_ret = t_in
-                pt_ret = h["point"]
+                raise ValueError(
+                    f"Unknown method '{method}'. Choose from: 'sample', 'strongest', 'first_hit', 'all', 'threshold'."
+                )
 
-            out_points.append(pt_ret)
-            out_probs.append(h["return_prob"])
-            out_ranges.append(t_ret)
-            out_normals.append(h["normal"])
-            out_ray_dirs.append(rays_d[ray_i])
-            out_rays_o.append(rays_o[ray_i])
-            out_obj_idx.append(h["object_idx"])
-            out_ray_idx.append(ray_i)
+            for h in selected_hits:
+                density = h["density"]
+                chord = h["chord"]
+                t_in = h["t_in"]
+
+                if return_placement in ("volume", "penetration", "inside"):
+                    if density > 1e-7 and chord > 1e-7:
+                        p_chord = 1.0 - np.exp(-density * chord)
+                        if method == "sample":
+                            # Sample penetration depth inside the volume according to exponential distribution
+                            u = np.random.rand()
+                            s = -np.log(np.maximum(1e-15, 1.0 - u * p_chord)) / density
+                        else:
+                            # Expected penetration depth for deterministic modes
+                            exp_decay = np.exp(-density * chord)
+                            if abs(p_chord) > 1e-7:
+                                s = (1.0 / density) - (chord * exp_decay / p_chord)
+                            else:
+                                s = chord / 2.0
+                        s = np.clip(s, 0.0, chord)
+                    else:
+                        s = 0.0
+                    t_ret = t_in + s
+                    pt_ret = rays_o[ray_i] + t_ret * rays_d[ray_i]
+                else:
+                    # Near surface placement
+                    t_ret = t_in
+                    pt_ret = h["point"]
+
+                out_points.append(pt_ret)
+                out_probs.append(h["return_prob"])
+                out_ranges.append(t_ret)
+                out_normals.append(h["normal"])
+                out_ray_dirs.append(rays_d[ray_i])
+                out_rays_o.append(rays_o[ray_i])
+                out_obj_idx.append(h["object_idx"])
+                out_ray_idx.append(ray_i)
 
     metadata = {
         "sensor": sensor,
         "sensor_position": np.asarray(sensor_position),
         "method": method,
-        "total_rays": len(rays_o),
+        "samples_per_ray": samples_per_ray,
+        "total_rays": len(rays_o) * samples_per_ray,
     }
 
     if len(out_points) == 0:

@@ -510,6 +510,679 @@ class HashGrid3D(nn.Module):
 
 
 # ==============================================================================
+# 1b. Coarse Unsigned Distance Field (UDF) Grid & Multi-Band Knot Placer
+# ==============================================================================
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _edt_1d_last_dim_kernel(
+        in_ptr,       # (L_lines, N) float32 contiguous
+        out_ptr,      # (L_lines, N) float32 contiguous
+        h_sq,         # float32: voxel spacing squared along this axis
+        L_lines,
+        N,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid_l = tl.program_id(0)
+        pid_q = tl.program_id(1)
+        if pid_l >= L_lines:
+            return
+
+        base = pid_l.to(tl.int64) * N
+        q = pid_q * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_q = q < N
+        qf = q.to(tl.float32)
+
+        best = tl.full([BLOCK_N], 1e20, dtype=tl.float32)
+        for p in range(0, N):
+            fp = tl.load(in_ptr + base + p)
+            if fp < 1e18:
+                diff = qf - p
+                cand = fp + h_sq * diff * diff
+                best = tl.minimum(best, cand)
+
+        tl.store(out_ptr + base + q, best, mask=mask_q)
+
+    @triton.jit
+    def _udf_trace_bands_kernel(
+        ray_o_ptr,        # (B, 3) float32 contiguous
+        ray_d_ptr,        # (B, 3) float32 contiguous
+        udf_ptr,          # (nx, ny, nz) float32 contiguous
+        band_a_ptr,       # (B, M_MAX) float32 pre-filled with s_max
+        band_b_ptr,       # (B, M_MAX) float32 pre-filled with s_max
+        B,
+        ox_min, oy_min, oz_min,
+        ox_max, oy_max, oz_max,
+        inv_dx, inv_dy, inv_dz,
+        nx, ny, nz,
+        s_min, s_max,
+        band_radius,
+        safe_margin,
+        fine_step,
+        M_MAX: tl.constexpr,
+        MAX_STEPS: tl.constexpr,
+        BLOCK_B: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_b = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+        mask_b = offs_b < B
+        b64 = offs_b.to(tl.int64)
+
+        ox = tl.load(ray_o_ptr + b64 * 3 + 0, mask=mask_b, other=0.0)
+        oy = tl.load(ray_o_ptr + b64 * 3 + 1, mask=mask_b, other=0.0)
+        oz = tl.load(ray_o_ptr + b64 * 3 + 2, mask=mask_b, other=0.0)
+
+        dx = tl.load(ray_d_ptr + b64 * 3 + 0, mask=mask_b, other=1.0)
+        dy = tl.load(ray_d_ptr + b64 * 3 + 1, mask=mask_b, other=0.0)
+        dz = tl.load(ray_d_ptr + b64 * 3 + 2, mask=mask_b, other=0.0)
+
+        # Ray-AABB slab intersection
+        eps = 1e-8
+        sdx = tl.where(tl.abs(dx) > eps, dx, tl.where(dx >= 0.0, eps, -eps))
+        sdy = tl.where(tl.abs(dy) > eps, dy, tl.where(dy >= 0.0, eps, -eps))
+        sdz = tl.where(tl.abs(dz) > eps, dz, tl.where(dz >= 0.0, eps, -eps))
+
+        t0x = (ox_min - ox) / sdx
+        t1x = (ox_max - ox) / sdx
+        t0y = (oy_min - oy) / sdy
+        t1y = (oy_max - oy) / sdy
+        t0z = (oz_min - oz) / sdz
+        t1z = (oz_max - oz) / sdz
+
+        tmin_x = tl.minimum(t0x, t1x)
+        tmax_x = tl.maximum(t0x, t1x)
+        tmin_y = tl.minimum(t0y, t1y)
+        tmax_y = tl.maximum(t0y, t1y)
+        tmin_z = tl.minimum(t0z, t1z)
+        tmax_z = tl.maximum(t0z, t1z)
+
+        t_enter = tl.maximum(s_min, tl.maximum(tmin_x, tl.maximum(tmin_y, tmin_z)))
+        t_exit = tl.minimum(s_max, tl.minimum(tmax_x, tl.minimum(tmax_y, tmax_z)))
+
+        active_ray = mask_b & (t_enter < t_exit)
+        t = t_enter
+        in_band = tl.zeros([BLOCK_B], dtype=tl.int1)
+        band_start = t_enter
+        m_cnt = tl.zeros([BLOCK_B], dtype=tl.int32)
+
+        nx_m1 = nx - 1
+        ny_m1 = ny - 1
+        nz_m1 = nz - 1
+        ny64 = tl.full([1], ny, dtype=tl.int64)
+        nz64 = tl.full([1], nz, dtype=tl.int64)
+
+        step_idx = 0
+        alive = active_ray & (t < t_exit)
+        while (step_idx < MAX_STEPS) and (tl.sum(alive.to(tl.int32), axis=0) > 0):
+            px = ox + t * dx
+            py = oy + t * dy
+            pz = oz + t * dz
+
+            ix = tl.minimum(tl.maximum(tl.floor((px - ox_min) * inv_dx + 0.5).to(tl.int32), 0), nx_m1)
+            iy = tl.minimum(tl.maximum(tl.floor((py - oy_min) * inv_dy + 0.5).to(tl.int32), 0), ny_m1)
+            iz = tl.minimum(tl.maximum(tl.floor((pz - oz_min) * inv_dz + 0.5).to(tl.int32), 0), nz_m1)
+
+            flat = (ix.to(tl.int64) * ny64 + iy.to(tl.int64)) * nz64 + iz.to(tl.int64)
+            d = tl.load(udf_ptr + flat, mask=alive, other=1e6)
+
+            hit_now = alive & (d <= band_radius)
+            entering = hit_now & (~in_band)
+            exiting = alive & (~hit_now) & in_band
+
+            band_start = tl.where(entering & (m_cnt < M_MAX), t, band_start)
+            in_band = tl.where(entering, True, in_band)
+
+            slot = tl.minimum(m_cnt, M_MAX - 1)
+            is_new = exiting & (m_cnt < M_MAX)
+            out_off = b64 * M_MAX + slot.to(tl.int64)
+            tl.store(band_a_ptr + out_off, band_start, mask=is_new)
+            tl.store(band_b_ptr + out_off, t, mask=exiting)
+
+            m_cnt = tl.where(is_new, m_cnt + 1, m_cnt)
+            in_band = tl.where(exiting, False, in_band)
+
+            step = tl.where(hit_now, fine_step, tl.maximum(d - safe_margin, fine_step))
+            t = tl.where(alive, t + step, t)
+            alive = active_ray & (t < t_exit)
+            step_idx += 1
+
+        # Close any band still open when leaving the AABB / hitting s_max
+        still_open = active_ray & in_band
+        slot = tl.minimum(m_cnt, M_MAX - 1)
+        is_new = still_open & (m_cnt < M_MAX)
+        t_end = tl.minimum(t, t_exit)
+        out_off = b64 * M_MAX + slot.to(tl.int64)
+        tl.store(band_a_ptr + out_off, band_start, mask=is_new)
+        tl.store(band_b_ptr + out_off, t_end, mask=still_open)
+
+    @triton.jit
+    def _bands_to_knots_kernel(
+        band_a_ptr,       # (B, M_MAX) float32
+        band_b_ptr,       # (B, M_MAX) float32
+        rand_ptr,         # (B, K) float32 (only read when USE_JITTER)
+        out_ptr,          # (B, K) float32
+        B,
+        K,
+        s_min,
+        s_max,
+        active_frac,
+        M_MAX: tl.constexpr,
+        USE_JITTER: tl.constexpr,
+        BLOCK_B: tl.constexpr,
+        K_PAD: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs_b = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+        mask_b = offs_b < B
+        b64 = offs_b.to(tl.int64)
+
+        k = tl.arange(0, K_PAD)
+        mask_k = k < K
+        mask_bk = mask_b[:, None] & mask_k[None, :]
+
+        # Stratified quantile targets u in (0, 1) for interior knots k in [1, K-2]
+        if USE_JITTER:
+            r_off = b64[:, None] * K + k[None, :].to(tl.int64)
+            r_val = tl.load(rand_ptr + r_off, mask=mask_bk, other=0.5)
+            u = ((k[None, :].to(tl.float32) - 1.0) + (0.05 + 0.90 * r_val)) / tl.maximum(K - 2, 1)
+        else:
+            u = k[None, :].to(tl.float32) / tl.maximum(K - 1, 1)
+
+        # Pass 1: total active weight (sqrt(len)) and total free weight (len)
+        sum_act = tl.zeros([BLOCK_B], dtype=tl.float32)
+        sum_free = tl.zeros([BLOCK_B], dtype=tl.float32)
+        prev_b = tl.full([BLOCK_B], s_min, dtype=tl.float32)
+
+        for m in tl.static_range(M_MAX):
+            off_m = b64 * M_MAX + m
+            am = tl.load(band_a_ptr + off_m, mask=mask_b, other=s_max)
+            bm = tl.load(band_b_ptr + off_m, mask=mask_b, other=s_max)
+            gf = tl.maximum(am - prev_b, 0.0)
+            ga = tl.maximum(bm - am, 0.0)
+            sum_free += tl.where(gf > 1e-5, gf, 0.0)
+            sum_act += tl.where(ga > 1e-5, tl.sqrt(ga + 1e-8), 0.0)
+            prev_b = bm
+
+        gf_last = tl.maximum(s_max - prev_b, 0.0)
+        sum_free += tl.where(gf_last > 1e-5, gf_last, 0.0)
+
+        has_act = sum_act > 1e-7
+        has_free = sum_free > 1e-7
+        p_act = tl.where(has_act & has_free, active_frac, tl.where(has_act, 1.0, 0.0))
+        scale_act = p_act / tl.maximum(sum_act, 1e-8)
+        scale_free = (1.0 - p_act) / tl.maximum(sum_free, 1e-8)
+
+        # Pass 2: invert piecewise-linear segment CDF in strictly increasing t order
+        s_out = tl.full([BLOCK_B, K_PAD], s_max, dtype=tl.float32)
+        assigned = tl.zeros([BLOCK_B, K_PAD], dtype=tl.int1)
+        w_cum = tl.zeros([BLOCK_B], dtype=tl.float32)
+        prev_b = tl.full([BLOCK_B], s_min, dtype=tl.float32)
+
+        for m in tl.static_range(M_MAX):
+            off_m = b64 * M_MAX + m
+            am = tl.load(band_a_ptr + off_m, mask=mask_b, other=s_max)
+            bm = tl.load(band_b_ptr + off_m, mask=mask_b, other=s_max)
+
+            # Free gap [prev_b, am]
+            gf = tl.maximum(am - prev_b, 0.0)
+            dw_f = tl.where(gf > 1e-5, gf * scale_free, 0.0)
+            w_next = w_cum + dw_f
+            hit_f = (~assigned) & (dw_f[:, None] > 1e-7) & (u <= w_next[:, None] + 1e-6)
+            alpha_f = tl.minimum(tl.maximum((u - w_cum[:, None]) / tl.maximum(dw_f[:, None], 1e-7), 0.0), 1.0)
+            s_out = tl.where(hit_f, prev_b[:, None] + alpha_f * gf[:, None], s_out)
+            assigned = assigned | hit_f
+            w_cum = w_next
+
+            # Active band [am, bm]
+            ga = tl.maximum(bm - am, 0.0)
+            dw_a = tl.where(ga > 1e-5, tl.sqrt(ga + 1e-8) * scale_act, 0.0)
+            w_next = w_cum + dw_a
+            hit_a = (~assigned) & (dw_a[:, None] > 1e-7) & (u <= w_next[:, None] + 1e-6)
+            alpha_a = tl.minimum(tl.maximum((u - w_cum[:, None]) / tl.maximum(dw_a[:, None], 1e-7), 0.0), 1.0)
+            s_out = tl.where(hit_a, am[:, None] + alpha_a * ga[:, None], s_out)
+            assigned = assigned | hit_a
+            w_cum = w_next
+
+            prev_b = bm
+
+        # Final free gap [prev_b, s_max]
+        gf_last = tl.maximum(s_max - prev_b, 0.0)
+        dw_l = tl.where(gf_last > 1e-5, gf_last * scale_free, 0.0)
+        w_next = w_cum + dw_l
+        hit_l = (~assigned) & (dw_l[:, None] > 1e-7) & (u <= w_next[:, None] + 1e-5)
+        alpha_l = tl.minimum(tl.maximum((u - w_cum[:, None]) / tl.maximum(dw_l[:, None], 1e-7), 0.0), 1.0)
+        s_out = tl.where(hit_l, prev_b[:, None] + alpha_l * gf_last[:, None], s_out)
+
+        # Pin endpoints exactly
+        s_out = tl.where(k[None, :] == 0, s_min, s_out)
+        s_out = tl.where(k[None, :] == (K - 1), s_max, s_out)
+
+        out_off = b64[:, None] * K + k[None, :].to(tl.int64)
+        tl.store(out_ptr + out_off, s_out, mask=mask_bk)
+
+
+class CoarseUDFGrid(nn.Module):
+    """Porous-safe Coarse 3D Unsigned Distance Field (UDF) for multi-band knot placement.
+
+    Replaces the learned Stage A shift hash grid + MLP with an explicit coarse GPU UDF
+    built directly from LiDAR hit envelopes:
+      1. Scatters hit points into a tight-AABB coarse voxel grid (preserving porous
+         foliage, glass windows, and thin fences without TSDF pass-through carving).
+      2. Computes the exact 3D Euclidean Distance Transform (UDF) on GPU in ~1-2 ms via
+         3 separable 1D Triton passes (or PyTorch fallback).
+      3. For each ray (both training and novel-view rendering), sphere-traces the UDF
+         in a single fused Triton kernel to discover ALL active bands [a_m, b_m] along
+         the ray, then allocates knots via piecewise-linear importance quantiles
+         (~75% in active bands with sqrt(length) weighting, ~25% in free space).
+
+    All grid tensors are registered as PyTorch buffers so checkpoints remain 100%
+    self-contained for novel-view rendering.
+    """
+
+    def __init__(
+        self,
+        bbox_min: Tuple[float, float, float],
+        bbox_max: Tuple[float, float, float],
+        grid_res: int = 128,
+        min_hits: int = 1,
+        band_radius: Optional[float] = None,
+        max_bands: int = 6,
+    ):
+        super().__init__()
+        x0, y0, z0 = (float(v) for v in bbox_min)
+        x1, y1, z1 = (float(v) for v in bbox_max)
+        sx = max(x1 - x0, 1e-3)
+        sy = max(y1 - y0, 1e-3)
+        sz = max(z1 - z0, 1e-3)
+        max_span = max(sx, sy, sz)
+
+        self.nx = max(16, int(round(grid_res * (sx / max_span))))
+        self.ny = max(16, int(round(grid_res * (sy / max_span))))
+        self.nz = max(16, int(round(grid_res * (sz / max_span))))
+        self.bbox_min = (x0, y0, z0)
+        self.bbox_max = (x1, y1, z1)
+        self.spacing = (
+            sx / max(1, self.nx - 1),
+            sy / max(1, self.ny - 1),
+            sz / max(1, self.nz - 1),
+        )
+        self.min_vox = min(self.spacing)
+        self.max_vox = max(self.spacing)
+        self.vox_diag = math.sqrt(sum(d * d for d in self.spacing))
+        self.min_hits = max(1, int(min_hits))
+        self.max_bands = max(1, int(max_bands))
+        # Default band_radius ~ 1.05 * vox_diag (~0.25-0.35m) brackets thin fences/glass
+        # and bridges minor scan-line gaps without overly wide bands.
+        self.band_radius = float(band_radius) if band_radius is not None else float(1.05 * self.vox_diag)
+        # Conservative sphere-tracing margin guarantees we never jump over an occupied voxel
+        self.safe_margin = float(self.band_radius + 0.25 * self.vox_diag)
+        self.fine_step = float(0.75 * self.min_vox)
+
+        self.register_buffer("bbox_min_t", torch.tensor([x0, y0, z0], dtype=torch.float32))
+        self.register_buffer("bbox_max_t", torch.tensor([x1, y1, z1], dtype=torch.float32))
+        self._inv_spacing = (
+            (self.nx - 1) / sx,
+            (self.ny - 1) / sy,
+            (self.nz - 1) / sz,
+        )
+        self.register_buffer("inv_spacing", torch.tensor(self._inv_spacing, dtype=torch.float32))
+        self.register_buffer("hit_counts", torch.zeros((self.nx, self.ny, self.nz), dtype=torch.int32))
+        self.register_buffer("udf_grid", torch.full((self.nx, self.ny, self.nz), 1e6, dtype=torch.float32))
+        self.register_buffer("has_data", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("_is_act_mask", ((torch.arange(2 * self.max_bands + 1) & 1) == 1).unsqueeze(0))
+        self._has_data: bool = False
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+        self._has_data = bool(self.has_data.item())
+
+    @torch.no_grad()
+    def clear(self) -> None:
+        self.hit_counts.zero_()
+        self.udf_grid.fill_(1e6)
+        self.has_data.fill_(False)
+        self._has_data = False
+
+    @torch.no_grad()
+    def update_from_batch(
+        self,
+        ray_o: torch.Tensor,
+        ray_d: torch.Tensor,
+        hit_range: torch.Tensor,
+        hit_mask: Optional[torch.Tensor] = None,
+        rebuild: bool = False,
+    ) -> None:
+        """Accumulates 3D hit points into the coarse voxel grid (zero CPU-GPU sync)."""
+        r = hit_range.view(-1)
+        pts = ray_o + r.unsqueeze(-1) * ray_d  # (B, 3)
+        ijk = torch.floor((pts - self.bbox_min_t) * self.inv_spacing + 0.5).long()
+        valid = (
+            (ijk[:, 0] >= 0) & (ijk[:, 0] < self.nx)
+            & (ijk[:, 1] >= 0) & (ijk[:, 1] < self.ny)
+            & (ijk[:, 2] >= 0) & (ijk[:, 2] < self.nz)
+        )
+        if hit_mask is not None:
+            valid = valid & (hit_mask.view(-1) > 0.5)
+
+        flat = (ijk[:, 0] * self.ny + ijk[:, 1]) * self.nz + ijk[:, 2]
+        flat = flat[valid]
+        if flat.numel() > 0:
+            ones = torch.ones_like(flat, dtype=torch.int32)
+            self.hit_counts.view(-1).scatter_add_(0, flat, ones)
+            if rebuild:
+                self.rebuild_udf()
+
+    @staticmethod
+    def _edt_1d_axis(d2: torch.Tensor, spacing: float) -> torch.Tensor:
+        """Exact 1D squared Euclidean distance transform along the last dimension."""
+        orig_shape = d2.shape
+        N = orig_shape[-1]
+        L_lines = d2.numel() // N
+        inp = d2.reshape(L_lines, N).contiguous()
+        h_sq = float(spacing * spacing)
+
+        if HAS_TRITON and inp.is_cuda:
+            out = torch.empty_like(inp)
+            BLOCK_N = 128
+            grid = (L_lines, triton.cdiv(N, BLOCK_N))
+            _edt_1d_last_dim_kernel[grid](inp, out, h_sq, L_lines, N, BLOCK_N=BLOCK_N)
+            return out.reshape(orig_shape)
+
+        # Pure PyTorch fallback (chunked over lines to keep memory bounded)
+        out = torch.empty_like(inp)
+        coords = torch.arange(N, device=inp.device, dtype=torch.float32)
+        dist_sq = h_sq * (coords.unsqueeze(1) - coords.unsqueeze(0)) ** 2  # (N, N)
+        chunk = max(1, min(L_lines, 4096))
+        for start in range(0, L_lines, chunk):
+            end = min(start + chunk, L_lines)
+            # (c, N, 1) + (1, N, N) -> min over p (dim=1) -> (c, N)
+            out[start:end] = (inp[start:end].unsqueeze(2) + dist_sq.unsqueeze(0)).min(dim=1).values
+        return out.reshape(orig_shape)
+
+    @torch.no_grad()
+    def rebuild_udf(self) -> float:
+        """Computes the exact 3D Euclidean UDF from accumulated hit_counts.
+
+        Returns:
+            Fraction of occupied voxels in [0, 1].
+        """
+        occ = self.hit_counts >= self.min_hits
+        occ_count = occ.sum()
+        if not bool(occ_count.item() > 0):
+            self.udf_grid.fill_(1e6)
+            self.has_data.fill_(False)
+            self._has_data = False
+            return 0.0
+
+        dx, dy, dz = self.spacing
+        d2 = torch.where(occ, torch.zeros((), device=occ.device, dtype=torch.float32), torch.full((), 1e20, device=occ.device, dtype=torch.float32))
+        # Separable exact 3D squared EDT: Z -> Y -> X
+        d2 = self._edt_1d_axis(d2, dz)
+        d2 = self._edt_1d_axis(d2.permute(0, 2, 1), dy).permute(0, 2, 1)
+        d2 = self._edt_1d_axis(d2.permute(1, 2, 0), dx).permute(2, 0, 1)
+        self.udf_grid.copy_(torch.sqrt(d2.clamp(min=0.0)))
+        self.has_data.fill_(True)
+        self._has_data = True
+        return float(occ_count.item()) / float(self.nx * self.ny * self.nz)
+
+    @torch.no_grad()
+    def build_from_rays(
+        self,
+        ray_o: torch.Tensor,
+        ray_d: torch.Tensor,
+        hit_range: torch.Tensor,
+        hit_mask: Optional[torch.Tensor] = None,
+        clear_first: bool = True,
+    ) -> float:
+        """One-shot GPU build of the coarse UDF from a full ray dataset."""
+        if clear_first:
+            self.clear()
+        self.update_from_batch(ray_o, ray_d, hit_range, hit_mask, rebuild=False)
+        return self.rebuild_udf()
+
+    @torch.no_grad()
+    def get_occupied_world_points(self, radius: Optional[float] = None) -> torch.Tensor:
+        """Returns world-space (N, 3) centers of voxels within `radius` of occupied geometry."""
+        r_thr = self.band_radius if radius is None else float(radius)
+        idx = torch.nonzero(self.udf_grid <= r_thr, as_tuple=False)
+        if idx.numel() == 0:
+            return torch.empty((0, 3), device=self.udf_grid.device, dtype=torch.float32)
+        dx, dy, dz = self.spacing
+        step_t = torch.tensor([dx, dy, dz], device=self.udf_grid.device, dtype=torch.float32)
+        return self.bbox_min_t.unsqueeze(0) + idx.float() * step_t.unsqueeze(0)
+
+    def _trace_bands_pytorch(
+        self,
+        ray_o: torch.Tensor,
+        ray_d: torch.Tensor,
+        s_min: float,
+        s_max: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pure-PyTorch fallback for multi-band UDF sphere tracing (CPU or non-Triton)."""
+        B = ray_o.shape[0]
+        device = ray_o.device
+        M = self.max_bands
+        band_a = torch.full((B, M), s_max, device=device, dtype=torch.float32)
+        band_b = torch.full((B, M), s_max, device=device, dtype=torch.float32)
+
+        eps = 1e-8
+        sd = torch.where(ray_d.abs() > eps, ray_d, torch.where(ray_d >= 0, eps, -eps))
+        t0 = (self.bbox_min_t - ray_o) / sd
+        t1 = (self.bbox_max_t - ray_o) / sd
+        t_enter = torch.maximum(torch.full((B,), s_min, device=device), torch.minimum(t0, t1).max(dim=-1).values)
+        t_exit = torch.minimum(torch.full((B,), s_max, device=device), torch.maximum(t0, t1).min(dim=-1).values)
+
+        active_ray = t_enter < t_exit
+        t = t_enter.clone()
+        in_band = torch.zeros(B, device=device, dtype=torch.bool)
+        band_start = t_enter.clone()
+        m_cnt = torch.zeros(B, device=device, dtype=torch.long)
+        ray_idx = torch.arange(B, device=device)
+
+        for _ in range(192):
+            alive = active_ray & (t < t_exit)
+            if not bool(alive.any()):
+                break
+            pts = ray_o + t.unsqueeze(-1) * ray_d
+            ijk = torch.floor((pts - self.bbox_min_t) * self.inv_spacing + 0.5).long()
+            ix = ijk[:, 0].clamp(0, self.nx - 1)
+            iy = ijk[:, 1].clamp(0, self.ny - 1)
+            iz = ijk[:, 2].clamp(0, self.nz - 1)
+            d = self.udf_grid[ix, iy, iz]
+
+            hit_now = alive & (d <= self.band_radius)
+            entering = hit_now & (~in_band)
+            exiting = alive & (~hit_now) & in_band
+
+            band_start = torch.where(entering & (m_cnt < M), t, band_start)
+            in_band = torch.where(entering, True, in_band)
+
+            if bool(exiting.any()):
+                slot = m_cnt.clamp(max=M - 1)
+                is_new = exiting & (m_cnt < M)
+                band_a[ray_idx[is_new], slot[is_new]] = band_start[is_new]
+                band_b[ray_idx[exiting], slot[exiting]] = t[exiting]
+                m_cnt = torch.where(is_new, m_cnt + 1, m_cnt)
+                in_band = torch.where(exiting, False, in_band)
+
+            step = torch.where(hit_now, self.fine_step, torch.clamp(d - self.safe_margin, min=self.fine_step))
+            t = torch.where(alive, t + step, t)
+
+        still_open = active_ray & in_band
+        if bool(still_open.any()):
+            slot = m_cnt.clamp(max=M - 1)
+            is_new = still_open & (m_cnt < M)
+            t_end = torch.minimum(t, t_exit)
+            band_a[ray_idx[is_new], slot[is_new]] = band_start[is_new]
+            band_b[ray_idx[still_open], slot[still_open]] = t_end[still_open]
+
+        return band_a, band_b
+
+    @torch.compiler.disable
+    @torch.no_grad()
+    def place_knots(
+        self,
+        ray_o: torch.Tensor,
+        ray_d: torch.Tensor,
+        num_knots: int,
+        s_min: float,
+        s_max: float,
+        active_frac: float = 0.75,
+        jitter: bool = False,
+    ) -> torch.Tensor:
+        """Places K strictly ordered knots along each ray guided by the coarse 3D UDF.
+
+        Args:
+            ray_o: Ray origins, shape (B, 3).
+            ray_d: Unit ray directions, shape (B, 3).
+            num_knots: Total knots K per ray (endpoints pinned at s_min and s_max).
+            s_min: Near ray bound in meters.
+            s_max: Far ray bound in meters.
+            active_frac: Fraction of interior knots allocated to active surface/volume bands.
+            jitter: If True (training), adds stratified jitter within each quantile stratum.
+
+        Returns:
+            s_knots: Strictly monotonic knot distances, shape (B, K).
+        """
+        B = ray_o.shape[0]
+        K = int(num_knots)
+        device = ray_o.device
+        K_int = K - 2
+
+        if K <= 2 or not self._has_data:
+            if jitter and K_int > 0:
+                base = torch.arange(K_int, device=device, dtype=torch.float32).unsqueeze(0)
+                u = (base + (0.05 + 0.90 * torch.rand((B, K_int), device=device))) / float(K_int)
+                s_int = s_min + u * (s_max - s_min)
+                return torch.cat(
+                    [
+                        torch.full((B, 1), s_min, device=device, dtype=torch.float32),
+                        s_int,
+                        torch.full((B, 1), s_max, device=device, dtype=torch.float32),
+                    ],
+                    dim=-1,
+                )
+            return torch.linspace(s_min, s_max, K, device=device, dtype=torch.float32).unsqueeze(0).expand(B, -1).contiguous()
+
+        M = self.max_bands
+        if HAS_TRITON and ray_o.is_cuda:
+            ro_c = ray_o.float().contiguous()
+            rd_c = ray_d.float().contiguous()
+            band_a = torch.full((B, M), float(s_max), device=device, dtype=torch.float32)
+            band_b = torch.full((B, M), float(s_max), device=device, dtype=torch.float32)
+            BLOCK_B = 128
+            grid = (triton.cdiv(B, BLOCK_B),)
+            _udf_trace_bands_kernel[grid](
+                ro_c,
+                rd_c,
+                self.udf_grid,
+                band_a,
+                band_b,
+                B,
+                self.bbox_min[0],
+                self.bbox_min[1],
+                self.bbox_min[2],
+                self.bbox_max[0],
+                self.bbox_max[1],
+                self.bbox_max[2],
+                self._inv_spacing[0],
+                self._inv_spacing[1],
+                self._inv_spacing[2],
+                self.nx,
+                self.ny,
+                self.nz,
+                float(s_min),
+                float(s_max),
+                self.band_radius,
+                self.safe_margin,
+                self.fine_step,
+                M_MAX=M,
+                MAX_STEPS=192,
+                BLOCK_B=BLOCK_B,
+            )
+            if K <= 128:
+                K_PAD = 1 << (K - 1).bit_length()
+                K_PAD = max(16, K_PAD)
+                BLOCK_K = 16 if K_PAD >= 64 else 32
+                s_knots = torch.empty((B, K), device=device, dtype=torch.float32)
+                rand_buf = torch.rand((B, K), device=device, dtype=torch.float32) if jitter else s_knots
+                _bands_to_knots_kernel[(triton.cdiv(B, BLOCK_K),)](
+                    band_a,
+                    band_b,
+                    rand_buf,
+                    s_knots,
+                    B,
+                    K,
+                    float(s_min),
+                    float(s_max),
+                    float(active_frac),
+                    M_MAX=M,
+                    USE_JITTER=bool(jitter),
+                    BLOCK_B=BLOCK_K,
+                    K_PAD=K_PAD,
+                )
+                return s_knots
+        else:
+            band_a, band_b = self._trace_bands_pytorch(ray_o.float(), ray_d.float(), s_min, s_max)
+
+        # Build sorted segment boundaries T: [s_min, a_0, b_0, a_1, b_1, ..., a_{M-1}, b_{M-1}, s_max]
+        # Even segments (0, 2, ..., 2M) = free-space gaps; Odd segments (1, 3, ..., 2M-1) = active bands.
+        ab = torch.stack([band_a, band_b], dim=-1).reshape(B, 2 * M)  # (B, 2M)
+        s0_col = torch.full((B, 1), float(s_min), device=device, dtype=torch.float32)
+        s1_col = torch.full((B, 1), float(s_max), device=device, dtype=torch.float32)
+        T = torch.cat([s0_col, ab, s1_col], dim=-1)  # (B, 2M + 2)
+        S = 2 * M + 1
+
+        seg_len = (T[:, 1:] - T[:, :-1]).clamp(min=0.0)  # (B, S)
+        is_act = self._is_act_mask  # (1, S)
+
+        # sqrt(length) weighting on active bands keeps thin solid walls dense alongside wide bushes
+        w_act_raw = torch.where(is_act & (seg_len > 1e-5), torch.sqrt(seg_len + 1e-8), torch.zeros_like(seg_len))
+        w_free_raw = torch.where((~is_act) & (seg_len > 1e-5), seg_len, torch.zeros_like(seg_len))
+
+        sum_act = w_act_raw.sum(dim=-1, keepdim=True)
+        sum_free = w_free_raw.sum(dim=-1, keepdim=True)
+
+        has_act = sum_act > 1e-7
+        has_free = sum_free > 1e-7
+        p_act = torch.where(
+            has_act & has_free,
+            torch.full_like(sum_act, float(active_frac)),
+            torch.where(has_act, torch.ones_like(sum_act), torch.zeros_like(sum_act)),
+        )
+
+        w_seg = (
+            p_act * (w_act_raw / sum_act.clamp(min=1e-8))
+            + (1.0 - p_act) * (w_free_raw / sum_free.clamp(min=1e-8))
+        )  # (B, S), rows sum to 1.0
+
+        W = torch.cat([torch.zeros((B, 1), device=device, dtype=torch.float32), torch.cumsum(w_seg, dim=-1)], dim=-1)
+        W[:, -1] = 1.0  # Guard against fp32 cumsum drift
+
+        # Stratified quantile targets u in (0, 1)
+        if jitter:
+            base = torch.arange(K_int, device=device, dtype=torch.float32).unsqueeze(0)
+            u = (base + (0.05 + 0.90 * torch.rand((B, K_int), device=device))) / float(K_int)
+        else:
+            u = torch.linspace(1.0 / (K - 1), (K - 2) / (K - 1), K_int, device=device, dtype=torch.float32)
+            u = u.unsqueeze(0).expand(B, -1).contiguous()
+
+        # Piecewise-linear inverse-CDF lookup (right=True skips zero-weight segments cleanly)
+        idx = torch.searchsorted(W.contiguous(), u.contiguous(), right=True).clamp(1, S)
+        idx_l = idx - 1
+        W_l = torch.gather(W, 1, idx_l)
+        W_r = torch.gather(W, 1, idx)
+        T_l = torch.gather(T, 1, idx_l)
+        T_r = torch.gather(T, 1, idx)
+
+        alpha = ((u - W_l) / (W_r - W_l).clamp(min=1e-7)).clamp(0.0, 1.0)
+        s_int = T_l + alpha * (T_r - T_l)
+
+        return torch.cat([s0_col, s_int, s1_col], dim=-1)
+
+
+# ==============================================================================
 # 2. Hash-Grid Self-Conditioned Knot Network (HashSCKNetwork)
 # ==============================================================================
 
@@ -546,22 +1219,22 @@ class HashSCKNetwork(nn.Module):
             at interval midpoints (+ direction d if use_viewdir) without ray_feat,
             maximizing cross-ray 3D consistency (README Rung 5a).
         use_viewdir: If True, passes unit ray direction d to the CDF head.
-        n_levels: HashGrid3D resolution levels (default 12).
+        n_levels: HashGrid3D resolution levels (default 16).
         n_features: HashGrid3D features per level (default 2).
-        log2_hashmap_size: Log2 hash table entries per level (default 16).
+        log2_hashmap_size: Log2 hash table entries per level (default 18).
         base_resolution: HashGrid3D coarsest resolution (default 16).
-        max_resolution: HashGrid3D finest resolution (default 512).
+        max_resolution: HashGrid3D finest resolution (default 2048).
         scene_bound: Half-extent of cubic 3D hash grid [-bound, +bound]^3 (default s_max).
         hash_backend: 'auto' (default), 'triton', 'tcnn', or 'pytorch'.
         coarse_to_fine: Enable progressive coarse-to-fine hash level masking (default True).
         ctf_start_levels: Initial coarsest hash levels active at Epoch 0 (default 4).
         ctf_end_frac: Training fraction at which all hash levels unlock (default 0.6).
-        lambda_curv: 3D curvature (2nd-order Laplacian) smoothness loss weight (default 0.05).
-        curv_samples: 3D points per batch for curvature loss (default 1024).
+        lambda_curv: RMS 3D curvature (2nd-order Laplacian) smoothness loss weight (default 0.4).
+        curv_samples: 3D points per batch for curvature loss (default 2048).
         curv_eps_start: Initial finite-difference step in meters for curvature loss (default 0.12).
         curv_eps_end: Final finite-difference step in meters for curvature loss (default 0.03).
-        lambda_hash_l2: Fine-level-only L2 decay weight on hash tables (default 1e-3; 0 disables).
-        reg_every: Lazy regularization cadence for 3D curvature + fine hash L2 (default 4; 1 = every step).
+        lambda_hash_l2: Fine-level-only L2 decay weight on hash tables (default 5e-3; 0 disables).
+        reg_every: Regularization cadence for 3D curvature + fine hash L2 (default 1 = every step).
         separate_shift_grid: If True (default), uses a dedicated coarse HashGrid3D for
             knot-shift prediction so empty-space attraction gradients never clash with
             the fine scene HashGrid3D.
@@ -583,13 +1256,22 @@ class HashSCKNetwork(nn.Module):
         cdf_mode: str = "softmax",            # [Fidelity] 'softmax' (width-aware + escape bin, smoother grads) vs 'hazard' (Beer-Lambert quadrature, stricter volumetric additivity).
         local_cdf: bool = True,               # [Fidelity, Speed] True = 3D hash(x_mid) only -> best cross-ray consistency & novel views; False = adds ray_feat (+H inputs, slightly slower).
         use_viewdir: bool = False,            # [Fidelity] Appends unit ray_d (+3 dims) to cdf_mlp. Enable only for anisotropic/view-dependent returns; False preserves isotropic 3D consistency.
-        n_levels: int = 12,                   # [Fidelity, Speed, Hashmap] Multi-res grid scales (base -> max). More = smoother multi-scale detail; scales hashmap VRAM & kernel work O(L).
+        n_levels: int = 16,                   # [Fidelity, Speed, Hashmap] Multi-res grid scales (base -> max). More = smoother multi-scale detail; scales hashmap VRAM & kernel work O(L).
         n_features: int = 2,                  # [Fidelity, Speed, Hashmap] Channels/entry; scales hashmap VRAM O(F). Note: fused Triton kernel requires n_features=2 (else falls back to slow PyTorch without tcnn).
-        log2_hashmap_size: int = 16,          # [Fidelity, Hashmap] Entries/level T=2^P (16 -> 65,536). Top fidelity lever for fewer fine-level collisions at ~O(1) compute; doubles hashmap VRAM per +1 (~4x incl. Adam+grad).
+        log2_hashmap_size: int = 18,          # [Fidelity, Hashmap] Entries/level T=2^P (18 -> 262,144). Top fidelity lever for fewer fine-level collisions at ~O(1) compute; doubles hashmap VRAM per +1 (~4x incl. Adam+grad).
         base_resolution: int = 16,            # [Fidelity] Coarsest grid resolution across [-bound, +bound]. Lower smooths sparse views; higher shifts levels toward finer detail.
         max_resolution: int = 2048,            # [Fidelity] Finest grid resolution across 2*bound (voxel = 2*bound/max_res). Raise (1024-2048) with larger log2_hashmap_size for sharper thin edges.
         scene_bound: Optional[float] = None,  # [Fidelity] Half-extent of cubic 3D hash grid [-bound, +bound]^3 (default s_max). Free fidelity boost when tightened to actual scene AABB.
         hash_backend: str = "auto",           # [Speed, Hashmap] 'tcnn' (fastest + dense coarse levels, if installed) > 'triton' (fast fused CUDA, n_features=2) >> 'pytorch' (slow fallback).
+        # --- Knot Placement Mode ('shift' = learned SCK flow, 'udf' = Coarse 3D UDF multi-band walker) ---
+        knot_mode: str = "shift",             # [Speed, Fidelity] 'shift' = learned self-conditioned knot flow (R rounds); 'udf' = non-neural coarse 3D UDF sphere-tracer (R=1, no shift MLP/grid, ~5-10x faster).
+        udf_grid_res: int = 128,              # [Fidelity, Speed] Coarse UDF resolution along longest AABB axis (knot_mode='udf').
+        udf_band_radius: Optional[float] = None,  # [Fidelity] Active band half-width around hit voxels in meters (None = 1.05 * voxel_diag).
+        udf_active_frac: float = 0.75,        # [Fidelity] Fraction of interior knots placed inside active surface/volume bands (remainder in free space).
+        udf_max_bands: int = 6,               # [Fidelity] Max distinct active bands tracked per ray (multi-surface glass/foliage/walls).
+        udf_min_hits: int = 1,                # [Fidelity] Min LiDAR hits per coarse voxel to mark occupied.
+        udf_bbox_min: Optional[Tuple[float, float, float]] = None,  # [Fidelity] Optional tight AABB min for coarse UDF (default [-bound]^3).
+        udf_bbox_max: Optional[Tuple[float, float, float]] = None,  # [Fidelity] Optional tight AABB max for coarse UDF (default [+bound]^3).
         # --- Separate Knot-Shift Hash Grid ("where to look" vs. "what is there") ---
         separate_shift_grid: bool = True,     # [Fidelity, Speed, Hashmap] True = dedicated coarse HashGrid3D for knot shifts (eliminates empty-space vs. sharp-surface gradient tension & speeds up Stage A); False = share scene hash_grid.
         shift_n_levels: int = 16,              # [Fidelity, Speed, Hashmap] Coarse resolution levels for shift_hash_grid (only used when separate_shift_grid=True).
@@ -600,23 +1282,27 @@ class HashSCKNetwork(nn.Module):
         coarse_to_fine: bool = True,          # [Fidelity] Progressive coarse-to-fine hash masking: locks in smooth coarse walls/ground before fine levels unlock (~0% cost).
         ctf_start_levels: int = 4,            # [Fidelity] Number of coarsest collision-free hash levels active at Epoch 0 when coarse_to_fine=True.
         ctf_end_frac: float = 0.6,            # [Fidelity] Training fraction at which all hash levels finish unlocking (0.6 = full fine resolution for final 40% of training).
-        lambda_curv: float = 0.05,            # [Fidelity, Speed] 3D curvature (2nd-order Laplacian) smoothness weight; flattens bumpy ripples while preserving sharp planar walls (~2-5% cost; 0 disables).
-        curv_samples: int = 1024,             # [Fidelity, Speed] Random 3D points/batch for curvature loss (75% near hit surfaces, 25% along free-space ray interiors).
+        lambda_curv: float = 0.4,             # [Fidelity, Speed] RMS 3D curvature (2nd-order Laplacian) smoothness weight; flattens bumpy ripples while preserving sharp planar walls (~5% cost; 0 disables).
+        curv_samples: int = 2048,             # [Fidelity, Speed] Random 3D points/batch for curvature loss (75% near hit surfaces, 25% along free-space ray interiors).
         curv_eps_start: float = 0.12,         # [Fidelity] Initial finite-difference step size (m) for 3D curvature at Epoch 0 (smooths broad waves).
         curv_eps_end: float = 0.03,           # [Fidelity] Final finite-difference step size (m) for 3D curvature once fine levels unlock (smooths cm-scale ripples).
-        lambda_hash_l2: float = 1e-3,         # [Fidelity] Fine-level-only L2 decay on hash tables (0 on coarse levels, linearly ramped to 1 on finest level). Kills collision speckles (~0% cost); too high (>1e-2) softens thin branches.
-        reg_every: int = 4,                   # [Speed] Lazy regularization cadence for 3D curvature + fine hash L2 (runs every N steps with N*lambda weight; 1 = every step).
+        lambda_hash_l2: float = 5e-3,         # [Fidelity] Fine-level-only L2 decay on hash tables (0 on coarse levels, linearly ramped to 1 on finest level). Scaled for 16x2^18 table; kills collision speckles without softening thin branches.
+        reg_every: int = 1,                   # [Speed] Regularization cadence for 3D curvature + fine hash L2 (1 = every step; >1 weakens regularization under Adam).
     ):
         super().__init__()
+        if knot_mode not in ("shift", "udf"):
+            raise ValueError(f"Unsupported knot_mode={knot_mode!r}; expected 'shift' or 'udf'.")
+        self.knot_mode = knot_mode
         self.num_knots = num_knots
         self.s_min = float(s_min)
         self.s_max = float(s_max)
-        self.num_rounds = num_rounds
+        self.num_rounds = 1 if knot_mode == "udf" else num_rounds
         self.max_displacement = float(max_displacement)
         self.cdf_mode = cdf_mode
-        self.local_cdf = local_cdf
+        self.local_cdf = True if knot_mode == "udf" else local_cdf
         self.use_viewdir = use_viewdir
-        self.separate_shift_grid = bool(separate_shift_grid)
+        self.udf_active_frac = float(udf_active_frac)
+        self.separate_shift_grid = bool(separate_shift_grid) and (knot_mode == "shift")
         self.coarse_to_fine = bool(coarse_to_fine)
         self.ctf_start_levels = int(ctf_start_levels)
         self.ctf_end_frac = float(ctf_end_frac)
@@ -647,50 +1333,70 @@ class HashSCKNetwork(nn.Module):
         )
         hash_dim = self.hash_grid.out_dim
 
-        # 1b. Optional Dedicated Coarse 3D Shift Hash Grid ("where to look")
-        if self.separate_shift_grid:
-            self.shift_hash_grid: Optional[HashGrid3D] = HashGrid3D(
-                n_levels=shift_n_levels,
-                n_features=n_features,
-                log2_hashmap_size=shift_log2_hashmap_size,
-                base_resolution=shift_base_resolution,
-                max_resolution=shift_max_resolution,
-                bound=bound,
-                backend=hash_backend,
+        # 1b. Stage A ("where to look"): either Coarse 3D UDF Grid OR Learned Shift HashGrid + MLP
+        if self.knot_mode == "udf":
+            bmin = udf_bbox_min if udf_bbox_min is not None else (-bound, -bound, -bound)
+            bmax = udf_bbox_max if udf_bbox_max is not None else (bound, bound, bound)
+            self.udf_grid: Optional[CoarseUDFGrid] = CoarseUDFGrid(
+                bbox_min=bmin,
+                bbox_max=bmax,
+                grid_res=udf_grid_res,
+                min_hits=udf_min_hits,
+                band_radius=udf_band_radius,
+                max_bands=udf_max_bands,
             )
-            shift_hash_dim = self.shift_hash_grid.out_dim
-        else:
             self.shift_hash_grid = None
-            shift_hash_dim = hash_dim
+            self.pos_enc_ray = None
+            self.ray_in = None
+            self.ray_proj = None
+            self.knot_proj = None
+            self.shift_blocks = None
+            self.shift_head = None
+        else:
+            self.udf_grid = None
+            if self.separate_shift_grid:
+                self.shift_hash_grid: Optional[HashGrid3D] = HashGrid3D(
+                    n_levels=shift_n_levels,
+                    n_features=n_features,
+                    log2_hashmap_size=shift_log2_hashmap_size,
+                    base_resolution=shift_base_resolution,
+                    max_resolution=shift_max_resolution,
+                    bound=bound,
+                    backend=hash_backend,
+                )
+                shift_hash_dim = self.shift_hash_grid.out_dim
+            else:
+                self.shift_hash_grid = None
+                shift_hash_dim = hash_dim
 
-        # 2. Compact Origin-Invariant Plücker Ray Encoder: (d, m = o x d) in R^6
-        self.pos_enc_ray = PositionalEncoding(in_dim=6, num_freqs=4, max_coord=bound)
-        self.ray_in = nn.Sequential(
-            nn.Linear(self.pos_enc_ray.out_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        # Split joint projection so ray_feat is projected ONCE per ray (not K*R times!)
-        self.ray_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.knot_proj = nn.Linear(shift_hash_dim + 3, hidden_dim, bias=False)
-
-        # 3. Lightweight Residual Shift Decoder (where to look)
-        self.shift_blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
+            # 2. Compact Origin-Invariant Plücker Ray Encoder: (d, m = o x d) in R^6
+            self.pos_enc_ray = PositionalEncoding(in_dim=6, num_freqs=4, max_coord=bound)
+            self.ray_in = nn.Sequential(
+                nn.Linear(self.pos_enc_ray.out_dim, hidden_dim),
                 nn.ReLU(inplace=True),
                 nn.Linear(hidden_dim, hidden_dim),
             )
-            for _ in range(num_hidden_blocks)
-        ])
-        self.shift_head = nn.Linear(hidden_dim, 1)
 
-        # 4. Compact CDF / Hazard Head evaluated at shifted interval midpoints (what is there)
+            # Split joint projection so ray_feat is projected ONCE per ray (not K*R times!)
+            self.ray_proj = nn.Linear(hidden_dim, hidden_dim)
+            self.knot_proj = nn.Linear(shift_hash_dim + 3, hidden_dim, bias=False)
+
+            # 3. Lightweight Residual Shift Decoder (where to look)
+            self.shift_blocks = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden_dim, hidden_dim),
+                )
+                for _ in range(num_hidden_blocks)
+            ])
+            self.shift_head = nn.Linear(hidden_dim, 1)
+
+        # 4. Compact CDF / Hazard Head evaluated at interval midpoints (what is there)
         cdf_in_dim = hash_dim + 3  # hash(x_mid) + normalized x_mid
         if use_viewdir:
             cdf_in_dim += 3
-        if not local_cdf:
+        if not self.local_cdf:
             cdf_in_dim += hidden_dim
 
         self.cdf_mlp = nn.Sequential(
@@ -701,9 +1407,10 @@ class HashSCKNetwork(nn.Module):
         )
         self.cdf_out = nn.Linear(hidden_dim, 1)
 
-        # 5. 3D-Grounded Ray-Drop Head: pools refined 3D midpoint features + c_max + ray_feat
+        # 5. 3D-Grounded Ray-Drop Head: pools refined 3D midpoint features + c_max (+ ray_feat in shift mode)
+        drop_in_dim = (hidden_dim + 1) if self.knot_mode == "udf" else (hidden_dim * 2 + 1)
         self.ray_drop_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 1, hidden_dim),
+            nn.Linear(drop_in_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, 1),
         )
@@ -719,23 +1426,33 @@ class HashSCKNetwork(nn.Module):
         )
         hash_params = scene_hash_params + shift_hash_params
         mlp_params = sum(p.numel() for p in self.parameters()) - hash_params
-        if self.shift_hash_grid is not None:
+        if self.udf_grid is not None:
+            udf_mb = (self.udf_grid.udf_grid.numel() * 4 + self.udf_grid.hit_counts.numel() * 4) / 1e6
             print(
-                f"HashSCKNetwork [{self.hash_grid.backend}] | "
+                f"HashSCKNetwork [{self.hash_grid.backend} | knot_mode=udf] | "
+                f"MLP params: {mlp_params:,} | "
+                f"Scene hash: {scene_hash_params:,} ({scene_hash_params * 4 / 1e6:.2f} MB) | "
+                f"Coarse UDF: {self.udf_grid.nx}x{self.udf_grid.ny}x{self.udf_grid.nz} "
+                f"(vox={self.udf_grid.max_vox:.2f}m, band={self.udf_grid.band_radius:.2f}m, {udf_mb:.2f} MB)"
+            )
+        elif self.shift_hash_grid is not None:
+            print(
+                f"HashSCKNetwork [{self.hash_grid.backend} | knot_mode=shift] | "
                 f"MLP params: {mlp_params:,} | "
                 f"Scene hash: {scene_hash_params:,} ({scene_hash_params * 4 / 1e6:.2f} MB) | "
                 f"Shift hash: {shift_hash_params:,} ({shift_hash_params * 4 / 1e6:.2f} MB)"
             )
         else:
             print(
-                f"HashSCKNetwork [{self.hash_grid.backend}] | "
+                f"HashSCKNetwork [{self.hash_grid.backend} | knot_mode=shift] | "
                 f"MLP params: {mlp_params:,} | Shared hash: {scene_hash_params:,} "
                 f"({scene_hash_params * 4 / 1e6:.2f} MB)"
             )
 
     def _init_custom_biases(self) -> None:
         with torch.no_grad():
-            self.shift_head.bias.fill_(0.0)
+            if self.shift_head is not None:
+                self.shift_head.bias.fill_(0.0)
             if self.cdf_mode == "softmax":
                 self.cdf_out.bias.fill_(0.0)
             else:
@@ -848,49 +1565,17 @@ class HashSCKNetwork(nn.Module):
             val = 1.0 - torch.exp(-F.softplus(raw))
         return val.reshape(*orig_shape)
 
-    def forward_single_pass(
+    def _eval_stage_b(
         self,
-        ray_feat: torch.Tensor,
-        ray_proj_feat: torch.Tensor,
         ray_o: torch.Tensor,
         ray_d: torch.Tensor,
         s_knots: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Executes one round of gap-bounded knot refinement + shifted midpoint CDF query.
-
-        Returns:
-            new_s_knots: (B, K) refined knot distances.
-            c_knots: (B, K) monotonic return CDF values at new_s_knots.
-            shift: (B, K) applied displacements.
-            pooled_3d: (B, hidden_dim) max-pooled 3D midpoint feature for ray-drop head.
-        """
+        ray_feat: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Stage B: Evaluates the 3D scene HashGrid + CDF head at knot interval midpoints."""
         B, K = s_knots.shape
-
-        # --- Stage A: Predict interior knot shifts (endpoints are pinned at shift == 0) ---
-        shift_grid = self.shift_hash_grid if self.shift_hash_grid is not None else self.hash_grid
-        s_interior = s_knots[:, 1:-1]  # (B, K-2)
-        x_knots = ray_o.unsqueeze(1) + s_interior.unsqueeze(-1) * ray_d.unsqueeze(1)  # (B, K-2, 3)
-        h_knots = shift_grid(x_knots)
-        knot_in = torch.cat([h_knots, x_knots / shift_grid.bound], dim=-1)
-
-        # Add pre-projected ray feature (computed once per ray!)
-        h = F.relu(ray_proj_feat.unsqueeze(1) + self.knot_proj(knot_in))
-        for block in self.shift_blocks:
-            h = F.relu(h + block(h))
-        shift_logits = self.shift_head(h).squeeze(-1)  # (B, K-2)
-
-        # Pinned endpoints + 45% nearest-neighbor gap bound (strictly monotone, no sort)
-        gaps = s_knots[:, 1:] - s_knots[:, :-1]  # (B, K-1)
-        room = 0.45 * torch.minimum(gaps[:, :-1], gaps[:, 1:])  # (B, K-2)
-        shift = torch.zeros_like(s_knots)
-        shift[:, 1:-1] = torch.tanh(shift_logits) * torch.clamp(
-            room, max=self.max_displacement
-        )
-        new_s_knots = s_knots + shift
-
-        # --- Stage B: Evaluate 3D HashGrid at SHIFTED interval midpoints ---
-        s_mid = 0.5 * (new_s_knots[:, :-1] + new_s_knots[:, 1:])  # (B, K-1)
-        delta_s = torch.clamp(new_s_knots[:, 1:] - new_s_knots[:, :-1], min=1e-4)  # (B, K-1)
+        s_mid = 0.5 * (s_knots[:, :-1] + s_knots[:, 1:])  # (B, K-1)
+        delta_s = torch.clamp(s_knots[:, 1:] - s_knots[:, :-1], min=1e-4)  # (B, K-1)
 
         x_mid = ray_o.unsqueeze(1) + s_mid.unsqueeze(-1) * ray_d.unsqueeze(1)  # (B, K-1, 3)
         h_mid = self.hash_grid(x_mid)
@@ -898,7 +1583,7 @@ class HashSCKNetwork(nn.Module):
         cdf_parts = [h_mid, x_mid / self.hash_grid.bound]
         if self.use_viewdir:
             cdf_parts.append(ray_d.unsqueeze(1).expand(-1, K - 1, -1))
-        if not self.local_cdf:
+        if not self.local_cdf and ray_feat is not None:
             cdf_parts.append(ray_feat.unsqueeze(1).expand(-1, K - 1, -1))
 
         cdf_feat = self.cdf_mlp(torch.cat(cdf_parts, dim=-1))  # (B, K-1, H)
@@ -925,6 +1610,48 @@ class HashSCKNetwork(nn.Module):
             )
 
         pooled_3d = cdf_feat.max(dim=1).values  # (B, H)
+        return c_knots, pooled_3d
+
+    def forward_single_pass(
+        self,
+        ray_feat: torch.Tensor,
+        ray_proj_feat: torch.Tensor,
+        ray_o: torch.Tensor,
+        ray_d: torch.Tensor,
+        s_knots: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Executes one round of gap-bounded knot refinement + shifted midpoint CDF query.
+
+        Returns:
+            new_s_knots: (B, K) refined knot distances.
+            c_knots: (B, K) monotonic return CDF values at new_s_knots.
+            shift: (B, K) applied displacements.
+            pooled_3d: (B, hidden_dim) max-pooled 3D midpoint feature for ray-drop head.
+        """
+        # --- Stage A: Predict interior knot shifts (endpoints are pinned at shift == 0) ---
+        shift_grid = self.shift_hash_grid if self.shift_hash_grid is not None else self.hash_grid
+        s_interior = s_knots[:, 1:-1]  # (B, K-2)
+        x_knots = ray_o.unsqueeze(1) + s_interior.unsqueeze(-1) * ray_d.unsqueeze(1)  # (B, K-2, 3)
+        h_knots = shift_grid(x_knots)
+        knot_in = torch.cat([h_knots, x_knots / shift_grid.bound], dim=-1)
+
+        # Add pre-projected ray feature (computed once per ray!)
+        h = F.relu(ray_proj_feat.unsqueeze(1) + self.knot_proj(knot_in))
+        for block in self.shift_blocks:
+            h = F.relu(h + block(h))
+        shift_logits = self.shift_head(h).squeeze(-1)  # (B, K-2)
+
+        # Pinned endpoints + 45% nearest-neighbor gap bound (strictly monotone, no sort)
+        gaps = s_knots[:, 1:] - s_knots[:, :-1]  # (B, K-1)
+        room = 0.45 * torch.minimum(gaps[:, :-1], gaps[:, 1:])  # (B, K-2)
+        shift = torch.zeros_like(s_knots)
+        shift[:, 1:-1] = torch.tanh(shift_logits) * torch.clamp(
+            room, max=self.max_displacement
+        )
+        new_s_knots = s_knots + shift
+
+        # --- Stage B: Evaluate 3D HashGrid at SHIFTED interval midpoints ---
+        c_knots, pooled_3d = self._eval_stage_b(ray_o, ray_d, new_s_knots, ray_feat=ray_feat)
         return new_s_knots, c_knots, shift, pooled_3d
 
     def forward(
@@ -932,7 +1659,23 @@ class HashSCKNetwork(nn.Module):
         ray_o: torch.Tensor,
         ray_d: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
-        """Multi-round self-conditioned knot estimation + 3D-grounded ray-drop prediction."""
+        """Knot placement (UDF-guided or multi-round self-conditioned) + 3D-grounded ray-drop."""
+        if self.knot_mode == "udf":
+            assert self.udf_grid is not None
+            s_knots = self.udf_grid.place_knots(
+                ray_o=ray_o,
+                ray_d=ray_d,
+                num_knots=self.num_knots,
+                s_min=self.s_min,
+                s_max=self.s_max,
+                active_frac=self.udf_active_frac,
+                jitter=self.training,
+            )
+            c_knots, pooled_3d = self._eval_stage_b(ray_o, ray_d, s_knots)
+            c_max = c_knots[:, -1:]
+            p_hit = torch.sigmoid(self.ray_drop_head(torch.cat([pooled_3d, c_max], dim=-1)))
+            return s_knots, c_knots, [(s_knots, c_knots)], p_hit
+
         B = ray_o.shape[0]
 
         # 1. Origin-invariant Plücker ray encoding (d, m = o x d), computed ONCE per ray
@@ -1035,17 +1778,18 @@ def compute_3d_curvature_loss(
     ray_d: torch.Tensor,
     hit_range: torch.Tensor,
     hit_mask: Optional[torch.Tensor] = None,
-    num_samples: int = 1024,
+    num_samples: int = 2048,
     eps: float = 0.05,
     s_max: float = 15.0,
 ) -> torch.Tensor:
-    """Neuralangelo-style 2nd-order finite-difference 3D curvature (Laplacian) regularizer.
+    """Neuralangelo-style RMS 2nd-order finite-difference 3D curvature (Laplacian) regularizer.
 
     Samples 3D points near observed hit surfaces (75%) and along observed ray interiors (25%),
     evaluates f(x + δ), f(x), f(x - δ) along random unit 3D directions in one batched pass,
-    and penalizes (f(x + δ) - 2 f(x) + f(x - δ))^2. Because the second derivative vanishes on
-    planar ramps, it flattens noisy hash-grid bumps/cauliflower ripples while preserving sharp
-    planar walls, roofs, and trunks. Zero CPU-GPU syncs.
+    and returns sqrt(mean((f(x + δ) - 2 f(x) + f(x - δ))^2) + 1e-6) so its scale matches
+    Root-CRPS instead of vanishing quadratically on small ripples. Because the second derivative
+    vanishes on planar ramps, it flattens noisy hash-grid bumps/cauliflower ripples while
+    preserving sharp planar walls, roofs, and trunks. Zero CPU-GPU syncs.
     """
     orig = getattr(model, "_orig_mod", model)
     B = ray_o.shape[0]
@@ -1083,7 +1827,7 @@ def compute_3d_curvature_loss(
     pts = torch.cat([x_mid, x_mid + delta, x_mid - delta], dim=0)  # (3n, 3)
     vals = orig.eval_local_3d_field(pts).view(3, n)
     lap = vals[1] - 2.0 * vals[0] + vals[2]
-    return (lap * lap).mean()
+    return torch.sqrt((lap * lap).mean() + 1e-6)
 
 
 def compute_fine_hash_l2_loss(model: torch.nn.Module) -> torch.Tensor:
@@ -1173,6 +1917,23 @@ def train_hash_sck_model(
 
     if not coarse_to_fine:
         orig.hash_grid.set_active_levels(orig.hash_grid.n_levels)
+
+    # Auto-build coarse UDF from GPU dataset rays if not already populated
+    if orig.knot_mode == "udf" and orig.udf_grid is not None and not orig.udf_grid._has_data:
+        if hasattr(dataloader, "rays_o") and hasattr(dataloader, "hit_ranges") and dataloader.hit_ranges is not None:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_udf = time.perf_counter()
+            occ_frac = orig.udf_grid.build_from_rays(
+                dataloader.rays_o, dataloader.rays_d, dataloader.hit_ranges, dataloader.hit_masks
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            if verbose:
+                print(
+                    f"Built CoarseUDFGrid in {(time.perf_counter() - t_udf) * 1000.0:.2f} ms "
+                    f"({occ_frac * 100.0:.2f}% occupied voxels)"
+                )
 
     if verbose:
         print(

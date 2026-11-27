@@ -645,6 +645,7 @@ def generate_dataset(
     out_dir: Union[str, Path] = "data",
     scene_type: str = "forest",
     num_poses: int = 48,
+    samples_per_ray: int = 4,
     orbit_radius: Optional[float] = None,
     orbit_height: float = 1.4,
     height_variation: float = 0.45,
@@ -659,6 +660,10 @@ def generate_dataset(
     save: bool = True,
 ) -> Dict[str, Any]:
     """Generates multi-view synthetic LiDAR scans, optionally saving them to disk."""
+    samples_per_ray = int(samples_per_ray)
+    if samples_per_ray < 1:
+        raise ValueError(f"samples_per_ray must be >= 1, got {samples_per_ray}.")
+
     out_path = Path(out_dir)
     scans_dir = out_path / "scans"
     if save:
@@ -687,8 +692,8 @@ def generate_dataset(
 
     dest_msg = f" -> {out_path.resolve()}" if save else " (in-memory)"
     print(
-        f"Generating {num_poses} scans of '{scene_type}' scene ({len(scene)} primitives, "
-        f"{sensor.total_rays:,} rays/scan, orbit_r={orbit_radius:.2f}m, "
+        f"Generating {num_poses} poses x {samples_per_ray} sample(s)/ray of '{scene_type}' scene "
+        f"({len(scene)} primitives, {sensor.total_rays:,} rays/scan, orbit_r={orbit_radius:.2f}m, "
         f"z={orbit_height:.2f}+/-{height_variation:.2f}m, "
         f"pitch/roll=+/-{max_pitch_deg:.1f}/{max_roll_deg:.1f}deg){dest_msg}"
     )
@@ -708,6 +713,7 @@ def generate_dataset(
             method="sample",
             return_placement="volume",
             return_misses=True,
+            samples_per_ray=samples_per_ray,
             random_seed=seed + i,
         )
 
@@ -747,6 +753,7 @@ def generate_dataset(
     config = {
         "scene_type": scene_type,
         "num_poses": num_poses,
+        "samples_per_ray": samples_per_ray,
         "orbit_radius": orbit_radius,
         "orbit_height": orbit_height,
         "height_variation": height_variation,
@@ -872,6 +879,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-poses", type=int, default=48, help="Number of orbiting sensor poses (default: 48)")
     parser.add_argument(
+        "--samples-per-ray",
+        type=int,
+        default=4,
+        help="Number of independent stochastic return samples drawn per ray at each pose (default: 4)",
+    )
+    parser.add_argument(
         "--orbit-radius",
         type=float,
         default=None,
@@ -896,6 +909,7 @@ def main() -> None:
         out_dir=args.out_dir,
         scene_type=args.scene,
         num_poses=args.num_poses,
+        samples_per_ray=args.samples_per_ray,
         orbit_radius=args.orbit_radius,
         orbit_height=args.orbit_height,
         height_variation=args.height_variation,

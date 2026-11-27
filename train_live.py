@@ -1762,42 +1762,55 @@ def eval_hash_3d_blocks_knotflow_gpu(
     bbox_min_t = torch.tensor([x0, y0, z0], device=device, dtype=torch.float32)
     inv_blk_span = torch.tensor([1.0 / (B * dx), 1.0 / (B * dy), 1.0 / (B * dz)], device=device, dtype=torch.float32)
 
-    # --- Stage 1: Discover occupied blocks via the model's own self-conditioned knot flow ---
+    # --- Stage 1: Discover occupied blocks via Coarse UDF (udf mode) OR self-conditioned knot flow ---
     active_kf = torch.zeros((nbx, nby, nbz), device=device, dtype=torch.bool)
-    total_probes = probe_rays_o.shape[0]
-    for i in range(0, total_probes, probe_batch_size):
-        j = min(i + probe_batch_size, total_probes)
-        bo = probe_rays_o[i:j]
-        bd = probe_rays_d[i:j]
-        s_knots, c_knots, _, p_hit = orig(bo, bd)
-        dc = c_knots[:, 1:] - c_knots[:, :-1]  # (P, K-1)
-        hit_interval = (p_hit > 0.25) & (dc > dc_thresh)
-        if not hit_interval.any():
-            continue
-        ray_idx, k_idx = torch.nonzero(hit_interval, as_tuple=True)
-        o_sel = bo[ray_idx]
-        d_sel = bd[ray_idx]
-        s_l = s_knots[ray_idx, k_idx]
-        s_r = s_knots[ray_idx, k_idx + 1]
-        s_m = 0.5 * (s_l + s_r)
-        # Mark midpoint + bracketing knot endpoints so surfaces near block faces activate both sides
-        pts_hit = torch.cat(
-            [
-                o_sel + s_m.unsqueeze(-1) * d_sel,
-                o_sel + s_l.unsqueeze(-1) * d_sel,
-                o_sel + s_r.unsqueeze(-1) * d_sel,
-            ],
-            dim=0,
-        )
-        b_ijk = torch.floor((pts_hit - bbox_min_t) * inv_blk_span).long()
-        inb = (
-            (b_ijk[:, 0] >= 0) & (b_ijk[:, 0] < nbx)
-            & (b_ijk[:, 1] >= 0) & (b_ijk[:, 1] < nby)
-            & (b_ijk[:, 2] >= 0) & (b_ijk[:, 2] < nbz)
-        )
-        b_ijk = b_ijk[inb]
-        if b_ijk.numel() > 0:
-            active_kf[b_ijk[:, 0], b_ijk[:, 1], b_ijk[:, 2]] = True
+    if orig.knot_mode == "udf" and orig.udf_grid is not None and orig.udf_grid._has_data:
+        pts_occ = orig.udf_grid.get_occupied_world_points()
+        if pts_occ.numel() > 0:
+            b_ijk = torch.floor((pts_occ - bbox_min_t) * inv_blk_span).long()
+            inb = (
+                (b_ijk[:, 0] >= 0) & (b_ijk[:, 0] < nbx)
+                & (b_ijk[:, 1] >= 0) & (b_ijk[:, 1] < nby)
+                & (b_ijk[:, 2] >= 0) & (b_ijk[:, 2] < nbz)
+            )
+            b_ijk = b_ijk[inb]
+            if b_ijk.numel() > 0:
+                active_kf[b_ijk[:, 0], b_ijk[:, 1], b_ijk[:, 2]] = True
+    else:
+        total_probes = probe_rays_o.shape[0]
+        for i in range(0, total_probes, probe_batch_size):
+            j = min(i + probe_batch_size, total_probes)
+            bo = probe_rays_o[i:j]
+            bd = probe_rays_d[i:j]
+            s_knots, c_knots, _, p_hit = orig(bo, bd)
+            dc = c_knots[:, 1:] - c_knots[:, :-1]  # (P, K-1)
+            hit_interval = (p_hit > 0.25) & (dc > dc_thresh)
+            if not hit_interval.any():
+                continue
+            ray_idx, k_idx = torch.nonzero(hit_interval, as_tuple=True)
+            o_sel = bo[ray_idx]
+            d_sel = bd[ray_idx]
+            s_l = s_knots[ray_idx, k_idx]
+            s_r = s_knots[ray_idx, k_idx + 1]
+            s_m = 0.5 * (s_l + s_r)
+            # Mark midpoint + bracketing knot endpoints so surfaces near block faces activate both sides
+            pts_hit = torch.cat(
+                [
+                    o_sel + s_m.unsqueeze(-1) * d_sel,
+                    o_sel + s_l.unsqueeze(-1) * d_sel,
+                    o_sel + s_r.unsqueeze(-1) * d_sel,
+                ],
+                dim=0,
+            )
+            b_ijk = torch.floor((pts_hit - bbox_min_t) * inv_blk_span).long()
+            inb = (
+                (b_ijk[:, 0] >= 0) & (b_ijk[:, 0] < nbx)
+                & (b_ijk[:, 1] >= 0) & (b_ijk[:, 1] < nby)
+                & (b_ijk[:, 2] >= 0) & (b_ijk[:, 2] < nbz)
+            )
+            b_ijk = b_ijk[inb]
+            if b_ijk.numel() > 0:
+                active_kf[b_ijk[:, 0], b_ijk[:, 1], b_ijk[:, 2]] = True
 
     # --- Stage 2: Fast coarse 3D pass (fallback for occluded pockets + wide blur v_wide) ---
     cnx = max(16, int(round(coarse_res * (sx / max_xy))))
@@ -2767,10 +2780,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=None, help="Batch size (default: 2048 for hash, 1024 for fourier)")
     parser.add_argument("--s-max", type=float, default=15.0, help="Max ray range in meters (default: 15.0)")
-    parser.add_argument("--num-knots", type=int, default=32, help="Number of spline knots K per ray (default: 32)")
-    parser.add_argument("--num-rounds", type=int, default=None, help="Self-conditioning rounds R (default: 2 for hash, 3 for fourier)")
+    parser.add_argument("--num-knots", type=int, default=None, help="Number of spline knots K per ray (default: 24 for udf, 32 for shift/fourier)")
+    parser.add_argument("--num-rounds", type=int, default=None, help="Self-conditioning rounds R (default: 1 for udf, 2 for shift, 3 for fourier)")
     parser.add_argument("--hidden-dim", type=int, default=None, help="MLP hidden dim (default: 64 for hash, 256 for fourier)")
     parser.add_argument("--cdf-mode", type=str, choices=["softmax", "hazard"], default="softmax", help="CDF parameterization (default: softmax)")
+    parser.add_argument("--knot-mode", type=str, choices=["shift", "udf"], default="shift", help="(Hash model) Knot placement: 'shift' (learned SCK flow) or 'udf' (Coarse 3D UDF multi-band walker)")
+    parser.add_argument("--udf-res", type=int, default=128, help="(UDF mode) Coarse 3D UDF grid resolution along longest axis (default: 128)")
+    parser.add_argument("--udf-active-frac", type=float, default=0.75, help="(UDF mode) Fraction of interior knots placed in active bands (default: 0.75)")
+    parser.add_argument("--udf-band-radius", type=float, default=None, help="(UDF mode) Active band half-width in meters (default: 1.05 * voxel_diag)")
+    parser.add_argument("--udf-online", action="store_true", help="(UDF mode) Build coarse UDF incrementally online during Epoch 0 instead of upfront")
     parser.add_argument("--joint-cdf", action="store_true", help="(Hash model) Condition CDF head on ray_feat instead of pure 3D local readout")
     parser.add_argument("--shared-shift-grid", action="store_true", help="(Hash model) Share the fine scene hash grid with the knot-shift MLP instead of using a separate coarse shift hash grid")
     parser.add_argument("--lr-mlp", type=float, default=1e-3, help="(Hash model) MLP learning rate (default: 1e-3)")
@@ -2785,7 +2803,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ctf-start-levels", type=int, default=None, help="(Hash model) Initial active coarse hash levels at Epoch 0 (default: from HashSCKNetwork)")
     parser.add_argument("--ctf-end-frac", type=float, default=None, help="(Hash model) Training fraction at which all hash levels unlock (default: from HashSCKNetwork)")
     parser.add_argument("--lambda-hash-l2", type=float, default=None, help="(Hash model) Fine-level-only L2 decay on hash tables (default: from HashSCKNetwork; 0 to disable)")
-    parser.add_argument("--reg-every", type=int, default=None, help="(Hash model) Lazy regularization cadence for curvature + fine hash L2 (default: from HashSCKNetwork, 4; 1 = every step)")
+    parser.add_argument("--reg-every", type=int, default=None, help="(Hash model) Regularization cadence for curvature + fine hash L2 (default: from HashSCKNetwork, 1 = every step)")
     parser.add_argument("--origin-slide", action="store_true", help="Enable vectorized GPU origin-sliding augmentation")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile (adds one-time JIT compile at Epoch 1, ~19%% faster after)")
 
@@ -2822,8 +2840,13 @@ def main() -> None:
 
     if args.batch_size is None:
         args.batch_size = 4096 if args.model == "hash" else 1024
+    if args.num_knots is None:
+        args.num_knots = 24 if (args.model == "hash" and args.knot_mode == "udf") else 32
     if args.num_rounds is None:
-        args.num_rounds = 2 if args.model == "hash" else 3
+        if args.model == "hash":
+            args.num_rounds = 1 if args.knot_mode == "udf" else 2
+        else:
+            args.num_rounds = 3
     if args.hidden_dim is None:
         args.hidden_dim = 64 if args.model == "hash" else 256
 
@@ -2856,7 +2879,8 @@ def main() -> None:
         flush=True,
     )
 
-    # 2. Build model (defaults to HashSCKNetwork)
+    # 2. Compute tight scene AABB and build model (defaults to HashSCKNetwork)
+    mesh_bbox_min, mesh_bbox_max = compute_scene_bbox(scene_cfg, args.s_max)
     if args.model == "hash":
         hash_kwargs: Dict[str, Any] = {
             "num_knots": args.num_knots,
@@ -2868,6 +2892,12 @@ def main() -> None:
             "cdf_mode": args.cdf_mode,
             "local_cdf": not args.joint_cdf,
             "scene_bound": args.s_max,
+            "knot_mode": args.knot_mode,
+            "udf_grid_res": args.udf_res,
+            "udf_active_frac": args.udf_active_frac,
+            "udf_band_radius": args.udf_band_radius,
+            "udf_bbox_min": mesh_bbox_min,
+            "udf_bbox_max": mesh_bbox_max,
         }
         if args.shared_shift_grid:
             hash_kwargs["separate_shift_grid"] = False
@@ -2886,6 +2916,20 @@ def main() -> None:
         if args.reg_every is not None:
             hash_kwargs["reg_every"] = args.reg_every
         model: torch.nn.Module = HashSCKNetwork(**hash_kwargs).to(device)
+        if args.knot_mode == "udf" and not args.udf_online:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_udf = time.perf_counter()
+            occ_frac = model.udf_grid.build_from_rays(
+                dataloader.rays_o, dataloader.rays_d, dataloader.hit_ranges, dataloader.hit_masks
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            print(
+                f"Built CoarseUDFGrid in {(time.perf_counter() - t_udf) * 1000.0:.2f} ms "
+                f"({occ_frac * 100.0:.2f}% occupied voxels, K={args.num_knots}, R=1)",
+                flush=True,
+            )
     else:
         model = DeeperSCKNetwork(
             num_knots=args.num_knots,
@@ -2932,7 +2976,6 @@ def main() -> None:
     )
 
     # 4. Start Three.js HTTP server + online GPU 3D visibility tracker + knot-flow probe rays
-    mesh_bbox_min, mesh_bbox_max = compute_scene_bbox(scene_cfg, args.s_max)
     kf_probe_rays_o, kf_probe_rays_d = build_knotflow_probe_rays(
         bbox_min=mesh_bbox_min,
         bbox_max=mesh_bbox_max,
@@ -3200,11 +3243,12 @@ def main() -> None:
     use_ctf = (args.model == "hash") and orig_model.coarse_to_fine
     ctf_steps = max(1.0, float(orig_model.ctf_end_frac) * total_train_steps) if args.model == "hash" else 1.0
     if args.model == "hash":
-        shift_lr_str = (
-            f", lr_shift_hash={args.lr_shift_hash:g}"
-            if orig_model.shift_hash_grid is not None
-            else " (shared shift grid)"
-        )
+        if orig_model.knot_mode == "udf":
+            shift_lr_str = f" (coarse UDF knot placer, online={args.udf_online})"
+        elif orig_model.shift_hash_grid is not None:
+            shift_lr_str = f", lr_shift_hash={args.lr_shift_hash:g}"
+        else:
+            shift_lr_str = " (shared shift grid)"
         print(
             f"Optimizer LRs: lr_mlp={args.lr_mlp:g}, lr_hash={args.lr_hash:g}{shift_lr_str} "
             f"(proportional cosine -> 5%)\n"
@@ -3227,6 +3271,8 @@ def main() -> None:
                 state.loss_history.clear()
             vis_grid.reset()
             if args.model == "hash":
+                if orig_model.knot_mode == "udf" and args.udf_online and orig_model.udf_grid is not None:
+                    orig_model.udf_grid.clear()
                 if use_ctf:
                     active_lvls = orig_model.set_coarse_to_fine_progress(0.0)
                 else:
@@ -3288,6 +3334,16 @@ def main() -> None:
                     # Online visibility tracking (sync-free; dataset is fixed so Epoch 0 covers all rays)
                     if epoch == 0:
                         vis_grid.update_batch(ray_o, ray_d, hit_range, hit_mask)
+                        if (
+                            args.model == "hash"
+                            and orig_model.knot_mode == "udf"
+                            and args.udf_online
+                            and orig_model.udf_grid is not None
+                        ):
+                            do_rebuild = ((global_step % 8) == 0) or (global_step == steps_per_epoch - 1)
+                            orig_model.udf_grid.update_from_batch(
+                                ray_o, ray_d, hit_range, hit_mask, rebuild=do_rebuild
+                            )
 
                     if args.origin_slide:
                         ray_o, hit_range, _ = vectorized_gpu_origin_slide(
